@@ -61,6 +61,30 @@ static void test_intent(void)
     assert(intent_from_transcript("他说左转", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("左转，然后前进", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("\"左转\"", NULL).type == INTENT_CHAT);
+    intent_t quieter = intent_from_transcript("你好小智，小声一点。", &wake_options[2]);
+    assert(quieter.type == INTENT_VOLUME_CHANGE && quieter.volume == -8);
+    intent_t volume = intent_from_transcript("把音量调到百分之三十五。", NULL);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 35);
+    volume = intent_from_transcript("音量调到30%！", NULL);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 30);
+    volume = intent_from_transcript("音量调到十％", NULL);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 10);
+    assert(intent_from_transcript("静音", NULL).volume == 0);
+    assert(intent_from_transcript("你能告诉我怎么调大音量吗", NULL).type == INTENT_CHAT);
+    assert(intent_from_transcript("音量调到101%", NULL).type == INTENT_CHAT);
+    intent_t slow = intent_from_transcript("走慢一点", NULL);
+    assert(slow.type == INTENT_VOICE_PACE && slow.pace == PACE_SLOW);
+    intent_t slow_forward = intent_from_transcript("慢一点往前走", NULL);
+    assert(slow_forward.type == INTENT_DRIVE && slow_forward.action == FORWARD && slow_forward.pace == PACE_SLOW);
+    intent_t fast_back = intent_from_transcript("后退快一点", NULL);
+    assert(fast_back.type == INTENT_DRIVE && fast_back.action == BACK && fast_back.pace == PACE_FAST);
+    assert(intent_from_transcript("加速右转", NULL).action == RIGHT);
+    assert(intent_from_transcript("慢慢左转，然后前进", NULL).type == INTENT_CHAT);
+    assert(intent_from_transcript("不要快一点后退", NULL).type == INTENT_CHAT);
+    assert(intent_from_transcript("急停", NULL).type == INTENT_MOTOR_LOCK);
+    assert(intent_from_transcript("开启电机", NULL).type == INTENT_MOTOR_ENABLE);
+    assert(intent_from_transcript("我在你哪个方向？", NULL).type == INTENT_CHAT);
+    assert(intent_from_transcript("我离你多远？", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("开始建图！", NULL).type == INTENT_EXPLORE);
     intent_t marker = intent_from_transcript("标记这里为客厅。", NULL);
     assert(marker.type == INTENT_MARK && !strcmp(marker.argument, "客厅"));
@@ -70,6 +94,16 @@ static void test_intent(void)
     text_copy(small, sizeof(small), "你好");
     assert(!strcmp(small, "你"));
     puts("PASS wake prefix, allowlisted motion, named navigation and UTF-8 output");
+}
+
+static void test_speech_direction(void)
+{
+    assert(speech_direction((unsigned[]){0, 2, 0, 0}) == DIR_UNKNOWN);
+    assert(speech_direction((unsigned[]){30, 7, 2, 1}) == DIR_LEFT);
+    assert(speech_direction((unsigned[]){0, 1, 1, 6}) == DIR_RIGHT);
+    assert(speech_direction((unsigned[]){0, 1, 6, 2}) == DIR_CENTER);
+    assert(speech_direction((unsigned[]){0, 4, 1, 4}) == DIR_UNKNOWN);
+    puts("PASS direction voting rejects sparse or conflicting positions");
 }
 
 static void test_audio(void)
@@ -92,12 +126,30 @@ static void test_audio(void)
     assert(count == 4 && !memcmp(continuous, fragmented, count * 2));
     assert(pcm_resampler_finish(&stream, fragmented) == 0);
     puts("PASS mono WAV layout and 24 to 16 kHz resampling across odd network reads");
+
+    all = (pcm_resampler_t){0};
+    stream = (pcm_resampler_t){0};
+    size_t slow_count = pcm_resample_24_to_18(&all, pcm, sizeof(pcm), continuous, 8);
+    assert(slow_count == 3);
+    assert(continuous[0] == 750 && continuous[1] == 4500 && continuous[2] == -7500);
+    slow_count += pcm_resampler_finish_18(&all, continuous + slow_count);
+    count = 0;
+    for (size_t offset = 0; offset < sizeof(pcm); ++offset) {
+        count += pcm_resample_24_to_18(&stream, pcm + offset, 1, fragmented + count, 8 - count);
+    }
+    count += pcm_resampler_finish_18(&stream, fragmented + count);
+    assert(count == 4 && count == slow_count && !memcmp(continuous, fragmented, count * 2));
+    uint8_t second[48000] = {0};
+    int16_t slowed[18000];
+    assert(pcm_resample_24_to_18(&all, second, sizeof(second), slowed, 18000) == 18000);
+    puts("PASS slower playback sample count, odd WebSocket boundaries and final samples");
 }
 
 int main(void)
 {
     test_grid();
     test_intent();
+    test_speech_direction();
     test_audio();
     return 0;
 }

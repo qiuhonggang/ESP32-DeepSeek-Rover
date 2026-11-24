@@ -37,3 +37,15 @@ direction_t estimate_direction(const int16_t *left, const int16_t *right, int co
     if (peak_lag < 0) return DIR_RIGHT;
     return DIR_CENTER;
 }
+
+direction_t speech_direction(const unsigned votes[DIR_RIGHT + 1])
+{
+    unsigned total = 0;
+    direction_t best = DIR_LEFT;
+    for (direction_t direction = DIR_LEFT; direction <= DIR_RIGHT; ++direction) {
+        total += votes[direction];
+        if (votes[direction] > votes[best]) best = direction;
+    }
+    if (total < 4 || votes[best] * 5 < total * 3) return DIR_UNKNOWN;
+    return best;
+}

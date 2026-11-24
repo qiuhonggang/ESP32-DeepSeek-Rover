@@ -88,6 +88,100 @@ static bool short_suffix(const char *suffix)
     return in(suffix, allowed);
 }
 
+static const struct { const char *phrase; voice_pace_t pace; } pace_words[] = {
+    {"慢一点", PACE_SLOW}, {"慢一些", PACE_SLOW}, {"慢点", PACE_SLOW}, {"慢慢", PACE_SLOW},
+    {"慢速", PACE_SLOW}, {"快一点", PACE_FAST}, {"快一些", PACE_FAST}, {"快点", PACE_FAST},
+    {"快速", PACE_FAST}, {"正常速度", PACE_NORMAL}, {"恢复正常速度", PACE_NORMAL},
+    {"减速", PACE_SLOW}, {"降速", PACE_SLOW}, {"加速", PACE_FAST}, {"提速", PACE_FAST},
+};
+
+static voice_pace_t pace_word(const char *text, const char **rest)
+{
+    for (size_t i = 0; i < sizeof(pace_words) / sizeof(pace_words[0]); ++i) {
+        const char *end = consume(text, pace_words[i].phrase);
+        if (end) {
+            *rest = end;
+            return pace_words[i].pace;
+        }
+    }
+    *rest = text;
+    return PACE_CURRENT;
+}
+
+static int chinese_digit(const char **text)
+{
+    static const char *const digits[] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    for (int i = 0; i < 10; ++i) {
+        const char *after = consume(*text, digits[i]);
+        if (after) {
+            *text = after;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int volume_number(const char *text)
+{
+    const char *prefix = consume(text, "百分之");
+    if (prefix) text = prefix;
+    int value = -1;
+    if (*text >= '0' && *text <= '9') {
+        value = 0;
+        while (*text >= '0' && *text <= '9' && value <= 100) value = value * 10 + *text++ - '0';
+    } else if (consume(text, "一百")) {
+        value = 100;
+        text += strlen("一百");
+    } else {
+        value = chinese_digit(&text);
+        const char *tens = consume(text, "十");
+        if (tens) {
+            text = tens;
+            int units = chinese_digit(&text);
+            value = (value < 0 ? 10 : value * 10) + (units < 0 ? 0 : units);
+        }
+    }
+    const char *percent = consume(text, "%");
+    if (!percent) percent = consume(text, "％");
+    if (percent) text = percent;
+    return value >= 0 && value <= 100 && (!*text || !strcmp(text, "吧")) ? value : -1;
+}
+
+static void volume_intent(const char *text, intent_t *intent)
+{
+    const char *bare = consume(text, "把");
+    if (bare) text = bare;
+    const char *const louder[] = {"大声一点", "大声点", "声音大一点", "声音大点", "声音调大一点",
+        "音量大一点", "音量调大", "音量调大一点", "调大音量", "提高音量", "加大音量", NULL};
+    const char *const softer[] = {"小声一点", "小声点", "声音小一点", "声音小点", "声音调小一点",
+        "音量小一点", "音量调小", "音量调小一点", "调小音量", "降低音量", NULL};
+    if (in(text, louder) || in(text, softer)) {
+        intent->type = INTENT_VOLUME_CHANGE;
+        intent->volume = in(text, louder) ? 8 : -8;
+        return;
+    }
+    if (!strcmp(text, "静音") || !strcmp(text, "声音关掉") || !strcmp(text, "关闭声音")) {
+        intent->type = INTENT_VOLUME_SET;
+        intent->volume = 0;
+        return;
+    }
+    if (!strcmp(text, "取消静音") || !strcmp(text, "恢复声音")) {
+        intent->type = INTENT_VOLUME_SET;
+        intent->volume = 28;
+        return;
+    }
+    const char *target = consume(text, "音量调到");
+    if (!target) target = consume(text, "音量设为");
+    if (!target) target = consume(text, "音量设置为");
+    if (!target) target = consume(text, "声音调到");
+    if (!target) return;
+    int number = volume_number(target);
+    if (number >= 0) {
+        intent->type = INTENT_VOLUME_SET;
+        intent->volume = number;
+    }
+}
+
 intent_t intent_from_transcript(const char *transcript, const wake_option_t *wake_word)
 {
     intent_t result = {.type = INTENT_CHAT, .action = STOP};
@@ -103,7 +197,9 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
         normalized[count++] = c < 128 ? (char)tolower(c) : (char)c;
     }
     normalized[count] = 0;
-    while (count && punctuation(normalized + count - 1) == 1) normalized[--count] = 0;
+    while (count && normalized[count - 1] != '%' && punctuation(normalized + count - 1) == 1) {
+        normalized[--count] = 0;
+    }
     while (count >= 3 && punctuation(normalized + count - 3) == 3) {
         count -= 3;
         normalized[count] = 0;
@@ -121,8 +217,14 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
     }
 
     const char *const stop[] = {"停", "停下", "停下来", "停止", "停止巡游", "停止导航",
-                                "急停", "别动", "不要动", "停车", "停下吧", NULL};
+                                "别动", "不要动", "停车", "停下吧", NULL};
     if (in(text, stop)) { result.type = INTENT_STOP; return result; }
+    const char *const lock[] = {"急停", "锁定电机", "关闭电机", "关掉电机", "停止电机", "关闭马达", NULL};
+    if (in(text, lock)) { result.type = INTENT_MOTOR_LOCK; return result; }
+    const char *const enable[] = {"启动电机", "开启电机", "打开电机", "启用电机", "解锁电机", "打开马达", NULL};
+    if (in(text, enable)) { result.type = INTENT_MOTOR_ENABLE; return result; }
+    volume_intent(text, &result);
+    if (result.type != INTENT_CHAT) return result;
 
     const char *const explore[] = {"开始巡游", "自动巡游", "开始建图", "开始探索", "建图", NULL};
     if (in(text, explore)) { result.type = INTENT_EXPLORE; return result; }
@@ -137,18 +239,37 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
     const char *const face[] = {"朝我转", "朝我转一下", "转向我", "面向我", "听声转向", NULL};
     if (in(text, face)) { result.type = INTENT_FACE_SOUND; return result; }
 
+    const char *pace_text = consume(text, "开");
+    if (!pace_text) pace_text = consume(text, "走");
+    if (!pace_text) pace_text = consume(text, "速度调");
+    if (!pace_text) pace_text = consume(text, "把速度调");
+    if (!pace_text) pace_text = consume(text, "速度");
+    if (!pace_text) pace_text = consume(text, "电机");
+    const char *pace_rest;
+    voice_pace_t chosen = pace_word(pace_text ? pace_text : text, &pace_rest);
+    if (chosen && short_suffix(pace_rest)) {
+        result.type = INTENT_VOICE_PACE;
+        result.pace = chosen;
+        return result;
+    }
+    const char *drive;
+    voice_pace_t prefix_pace = pace_word(text, &drive);
     const struct { const char *prefix; action_t action; } moves[] = {
-        {"前进", FORWARD}, {"往前走", FORWARD}, {"向前走", FORWARD},
+        {"前进", FORWARD}, {"往前走", FORWARD}, {"向前走", FORWARD}, {"往前开", FORWARD},
         {"后退", BACK}, {"往后走", BACK}, {"向后走", BACK},
-        {"左转", LEFT}, {"向左转", LEFT}, {"往左转", LEFT},
-        {"右转", RIGHT}, {"向右转", RIGHT}, {"往右转", RIGHT},
+        {"左转", LEFT}, {"向左转", LEFT}, {"往左转", LEFT}, {"左拐", LEFT},
+        {"右转", RIGHT}, {"向右转", RIGHT}, {"往右转", RIGHT}, {"右拐", RIGHT},
         {"扭一扭", WIGGLE}, {"扭一下", WIGGLE}, {"摆一摆", WIGGLE},
     };
-    for (int i = 0; i < sizeof(moves) / sizeof(moves[0]); ++i) {
-        const char *rest = consume(text, moves[i].prefix);
-        if (rest && short_suffix(rest)) {
+    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); ++i) {
+        const char *rest = consume(drive, moves[i].prefix);
+        if (!rest) continue;
+        const char *suffix;
+        voice_pace_t suffix_pace = pace_word(rest, &suffix);
+        if ((!prefix_pace || !suffix_pace) && short_suffix(suffix)) {
             result.type = INTENT_DRIVE;
             result.action = moves[i].action;
+            result.pace = prefix_pace ? prefix_pace : suffix_pace;
             return result;
         }
     }

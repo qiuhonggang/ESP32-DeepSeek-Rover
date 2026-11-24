@@ -15,7 +15,7 @@ static const int MOTOR_PINS[] = {
     PIN_LF_A, PIN_LF_B, PIN_RF_A, PIN_RF_B, PIN_LR_A, PIN_LR_B, PIN_RR_A, PIN_RR_B,
 };
 static portMUX_TYPE guard = portMUX_INITIALIZER_UNLOCKED;
-static motion_status_t status = {.cm = -1, .blocked = true};
+static motion_status_t status = {.cm = -1, .sample_age_ms = -1, .wheel = -1, .blocked = true};
 static struct {
     action_t action;
     int speed, duration_ms, wheel;
@@ -55,7 +55,9 @@ motion_status_t motion_status(void)
 {
     taskENTER_CRITICAL(&guard);
     motion_status_t copy = status;
-    if (esp_timer_get_time() - last_measurement >= 170000) {
+    int64_t age_us = esp_timer_get_time() - last_measurement;
+    if (last_measurement) copy.sample_age_ms = (int)(age_us / 1000);
+    if (age_us >= 170000) {
         copy.valid = false;
         copy.blocked = true;
         copy.cm = -1;
@@ -125,6 +127,10 @@ uint32_t motion_submit(action_t action, int speed, int duration_ms, motion_sourc
         if (++status.ticket == 0) ++status.ticket;
         status.result = MOTION_RUNNING;
         status.action = action;
+        status.last_action = action;
+        status.wheel = wheel;
+        status.pwm = speed;
+        status.duration_ms = duration_ms;
         ticket = status.ticket;
     }
     taskEXIT_CRITICAL(&guard);
@@ -171,6 +177,7 @@ static void sonar_task(void *unused)
 
         taskENTER_CRITICAL(&guard);
         echo_open = false;
+        status.echo_us = (int)echo_width;
         status.valid = echo_width >= 100 && echo_width <= 23500;
         status.cm = status.valid ? (int)((echo_width + 29) / 58) : -1;
         ++status.measurement;

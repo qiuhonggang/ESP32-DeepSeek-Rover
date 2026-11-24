@@ -3,6 +3,7 @@
 #include "esp_wn_models.h"
 #include "model_path.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 #include "driver/i2s_std.h"
 #include "esp_aec.h"
@@ -14,10 +15,17 @@
 #include "freertos/task.h"
 
 #define PLAY_CAPACITY 16384
+#define PLAY_START_SAMPLES (SAMPLE_RATE * 240 / 1000)
+#define PLAY_REFILL_SAMPLES (SAMPLE_RATE * 400 / 1000)
 #define PREROLL 9
 #define REF_HISTORY 4
 #define TEST_TONE_ID UINT32_MAX
-#define PLAY_DRAIN_US 85000
+#define WAKE_CUE_ID (UINT32_MAX - 1)
+#define PLAY_DRAIN_US 130000
+#define PLAY_IDLE_US 8000000
+#define ECHO_TAIL_US 250000
+#define BARGE_VOICE_WINDOW_US 350000
+#define WAKE_DRAIN_US 950000
 
 const wake_option_t *audio_selected_wake(void)
 {
@@ -32,13 +40,16 @@ static const esp_wn_iface_t *wake;
 static model_iface_data_t *wake_data;
 static int wake_frame, wake_used;
 static int16_t wake_pcm[2048] __attribute__((aligned(16)));
-static bool force_listen;
+static const int16_t wake_silence[MAX_FRAME];
+typedef enum { LISTEN_NONE, LISTEN_CONVERSATION, LISTEN_ASR_ONLY } listen_mode_t;
+static listen_mode_t force_listen;
 static uint32_t interrupted_id;
 static int frame;
 static bool initialized;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE reference_lock = portMUX_INITIALIZER_UNLOCKED;
 static audio_status_t telemetry;
+static atomic_int volume;
 static uint32_t turn_id;
 static uint32_t next_id;
 static unsigned reset_capture;
@@ -46,12 +57,13 @@ static struct {
     int16_t pcm[PLAY_CAPACITY];
     size_t read, length;
     uint32_t id;
-    int64_t start, last_rx, drain_after;
+    int64_t last_rx, drain_after;
     unsigned tone_sample;
-    bool active, ended, started;
+    bool active, ended, started, isolated, buffering;
 } play;
 static int16_t references[REF_HISTORY][MAX_FRAME];
-static unsigned reference_index;
+static int16_t reference_pending[MAX_FRAME];
+static unsigned reference_index, reference_used;
 static int16_t preroll[PREROLL][MAX_FRAME];
 static int32_t i2s_rx[MAX_FRAME * 2], i2s_tx[MAX_FRAME * 2];
 static int16_t mic_l[MAX_FRAME], mic_r[MAX_FRAME];
@@ -74,36 +86,74 @@ audio_status_t audio_status(void)
     return copy;
 }
 
+const char *playback_result_name(playback_result_t result)
+{
+    const char *names[] = {"none", "complete", "wake_word", "manual", "i2s_error", "timeout",
+                           "network_lost", "cloud_error"};
+    return names[result >= PLAYBACK_NONE && result <= PLAYBACK_CLOUD_ERROR ? result : PLAYBACK_NONE];
+}
+
 static bool send_event(uplink_type_t type, uint32_t id, direction_t direction);
 
-static void clear_play(void)
+static void clear_play(playback_result_t result)
 {
+    if (play.active && play.id != TEST_TONE_ID && play.id != WAKE_CUE_ID) {
+        telemetry.playback_result = result;
+    }
     play.active = false;
     play.length = 0;
     play.ended = false;
     play.started = false;
 }
 
-void audio_interrupt(void)
+static void interrupt_audio(playback_result_t result)
 {
     taskENTER_CRITICAL(&state_lock);
     interrupted_id = turn_id;
-    force_listen = false;
-    clear_play();
+    force_listen = LISTEN_NONE;
+    clear_play(result);
     ++reset_capture;
     turn_id = 0;
     telemetry.listening = false;
     taskEXIT_CRITICAL(&state_lock);
 }
 
-bool audio_listen_once(void)
+void audio_interrupt(void)
+{
+    interrupt_audio(PLAYBACK_MANUAL);
+}
+
+void audio_network_lost(void)
+{
+    interrupt_audio(PLAYBACK_NETWORK_LOST);
+}
+
+bool audio_listen_once(bool asr_only)
 {
     if (!network_ready()) return false;
     taskENTER_CRITICAL(&state_lock);
     bool accepted = initialized && !telemetry.listening && !force_listen;
-    if (accepted) force_listen = true;
+    if (accepted) force_listen = asr_only ? LISTEN_ASR_ONLY : LISTEN_CONVERSATION;
     taskEXIT_CRITICAL(&state_lock);
     return accepted;
+}
+
+static uint32_t next_turn_locked(void)
+{
+    if (++next_id > INT32_MAX) next_id = 1;
+    return next_id;
+}
+
+uint32_t audio_begin_debug_turn(void)
+{
+    if (!network_ready()) return 0;
+    taskENTER_CRITICAL(&state_lock);
+    uint32_t id = 0;
+    if (initialized && !telemetry.listening && !force_listen && !play.active) {
+        id = turn_id = next_turn_locked();
+    }
+    taskEXIT_CRITICAL(&state_lock);
+    return id;
 }
 
 void audio_cancel_turn(uint32_t id)
@@ -114,7 +164,7 @@ void audio_cancel_turn(uint32_t id)
         ++reset_capture;
         telemetry.listening = false;
     }
-    if (play.active && play.id == id) clear_play();
+    if (play.active && play.id == id) clear_play(PLAYBACK_CLOUD_ERROR);
     taskEXIT_CRITICAL(&state_lock);
 }
 
@@ -126,21 +176,22 @@ bool audio_turn_is_current(uint32_t id)
     return current;
 }
 
-bool audio_begin_play(uint32_t id)
+bool audio_begin_play(uint32_t id, bool isolated)
 {
     taskENTER_CRITICAL(&state_lock);
     bool accepted = initialized && !telemetry.listening && !play.active &&
-                    (id == 0 || id == TEST_TONE_ID || id == turn_id);
+                    (id == 0 || id == TEST_TONE_ID || id == WAKE_CUE_ID || id == turn_id);
     if (accepted) {
         play.id = id;
         play.read = play.length = 0;
         play.tone_sample = 0;
         play.last_rx = esp_timer_get_time();
-        play.start = 0;
         play.drain_after = 0;
         play.active = true;
         play.started = false;
+        play.isolated = isolated;
         play.ended = id == TEST_TONE_ID;
+        play.buffering = id != TEST_TONE_ID;
     }
     taskEXIT_CRITICAL(&state_lock);
     return accepted;
@@ -148,15 +199,25 @@ bool audio_begin_play(uint32_t id)
 
 bool audio_test_tone(void)
 {
-    return audio_begin_play(TEST_TONE_ID);
+    return audio_begin_play(TEST_TONE_ID, true);
 }
 
-bool audio_push_play(const void *data, size_t size)
+void audio_set_volume(int value)
+{
+    atomic_store(&volume, value);
+}
+
+int audio_volume(void)
+{
+    return atomic_load(&volume);
+}
+
+bool audio_push_play(uint32_t id, const void *data, size_t size)
 {
     if (!size || size % 2 || size > MAX_WIRE_BYTES) return false;
     taskENTER_CRITICAL(&state_lock);
     size_t count = size / sizeof(int16_t);
-    bool accepted = play.active && !play.ended && count <= PLAY_CAPACITY - play.length;
+    bool accepted = play.active && play.id == id && !play.ended && count <= PLAY_CAPACITY - play.length;
     if (accepted) {
         size_t start = (play.read + play.length) % PLAY_CAPACITY;
         size_t first = PLAY_CAPACITY - start;
@@ -177,6 +238,40 @@ void audio_end_play(uint32_t id)
     taskEXIT_CRITICAL(&state_lock);
 }
 
+#define CUE_ASSET(n) \
+    extern const uint8_t cue_##n##_start[] asm("_binary_wake_" #n "_pcm_start"); \
+    extern const uint8_t cue_##n##_end[] asm("_binary_wake_" #n "_pcm_end")
+CUE_ASSET(1);
+CUE_ASSET(2);
+CUE_ASSET(3);
+CUE_ASSET(4);
+#undef CUE_ASSET
+
+bool audio_wake_feedback(void)
+{
+    static const struct { const uint8_t *start, *end; } clips[] = {
+        {cue_1_start, cue_1_end}, {cue_2_start, cue_2_end},
+        {cue_3_start, cue_3_end}, {cue_4_start, cue_4_end},
+    };
+    taskENTER_CRITICAL(&state_lock);
+    unsigned clip = telemetry.wake_cue % (sizeof(clips) / sizeof(clips[0]));
+    size_t bytes = clips[clip].end - clips[clip].start;
+    bool accepted = initialized && !play.active && !telemetry.listening && bytes <= sizeof(play.pcm);
+    if (accepted) {
+        memcpy(play.pcm, clips[clip].start, bytes);
+        play.id = WAKE_CUE_ID;
+        play.read = 0;
+        play.length = bytes / sizeof(int16_t);
+        play.last_rx = esp_timer_get_time();
+        play.drain_after = 0;
+        play.active = play.ended = play.isolated = true;
+        play.started = play.buffering = false;
+        ++telemetry.wake_cue;
+    }
+    taskEXIT_CRITICAL(&state_lock);
+    return accepted;
+}
+
 static bool send_event(uplink_type_t type, uint32_t id, direction_t direction)
 {
     uplink_t packet = {.type = type, .id = id, .direction = direction};
@@ -194,16 +289,24 @@ static bool tx_complete(i2s_chan_handle_t handle, i2s_event_data_t *event, void 
 {
     (void)handle;
     (void)unused;
-    if (!event->dma_buf || event->size != frame * 8) return false;
+    const size_t sample_bytes = 2 * sizeof(int32_t);
+    if (!event->dma_buf || event->size % sample_bytes) return false;
     const int32_t *samples = event->dma_buf;
+    size_t count = event->size / sample_bytes;
     portENTER_CRITICAL_ISR(&reference_lock);
-    unsigned index = ++reference_index % REF_HISTORY;
-    for (int i = 0; i < frame; ++i) references[index][i] = (int16_t)(samples[i * 2] >> 16);
+    for (size_t i = 0; i < count; ++i) {
+        reference_pending[reference_used++] = (int16_t)(samples[i * 2] >> 16);
+        if (reference_used == frame) {
+            unsigned index = ++reference_index % REF_HISTORY;
+            memcpy(references[index], reference_pending, frame * sizeof(int16_t));
+            reference_used = 0;
+        }
+    }
     portEXIT_CRITICAL_ISR(&reference_lock);
     return false;
 }
 
-static void fill_output(int64_t now, bool *speaking, int64_t *play_start)
+static void fill_output(int64_t now, bool *playing, bool *speaking, bool *isolated)
 {
     uint32_t completed = TEST_TONE_ID;
     bool drained = false;
@@ -212,14 +315,20 @@ static void fill_output(int64_t now, bool *speaking, int64_t *play_start)
     memset(outgoing, 0, frame * sizeof(int16_t));
     taskENTER_CRITICAL(&state_lock);
     if (play.active) {
+        if (play.id != TEST_TONE_ID && !play.ended && play.started &&
+            !play.buffering && play.length < (size_t)frame) {
+            play.buffering = true;
+            ++telemetry.playback_underruns;
+        }
+        size_t target = play.started ? PLAY_REFILL_SAMPLES : PLAY_START_SAMPLES;
+        if (play.ended || play.length >= target) play.buffering = false;
         if (play.id == TEST_TONE_ID && play.tone_sample < 8000) {
             tone_active = true;
             tone = play.tone_sample;
             play.tone_sample += frame;
             play.drain_after = now + PLAY_DRAIN_US;
-            if (!play.started) play.start = now;
             play.started = true;
-        } else if (play.length && (play.started || play.ended || play.length >= (size_t)(frame * 4))) {
+        } else if (play.length && !play.buffering) {
             size_t count = play.length < frame ? play.length : frame;
             size_t first = PLAY_CAPACITY - play.read;
             if (first > count) first = count;
@@ -228,30 +337,31 @@ static void fill_output(int64_t now, bool *speaking, int64_t *play_start)
             play.length -= count;
             play.read = (play.read + count) % PLAY_CAPACITY;
             play.drain_after = now + PLAY_DRAIN_US;
-            if (!play.started) play.start = now;
             play.started = true;
         } else if ((play.ended && !play.length && now >= play.drain_after) ||
-                   now - play.last_rx > 1600000) {
+                   now - play.last_rx > PLAY_IDLE_US) {
             completed = play.id;
             drained = play.ended && !play.length && now >= play.drain_after;
-            clear_play();
+            clear_play(drained ? PLAYBACK_COMPLETE : PLAYBACK_TIMEOUT);
         }
     }
-    *speaking = play.active && play.started;
-    *play_start = play.start;
+    *playing = play.active;
+    *speaking = *playing && play.started;
+    *isolated = *playing && play.isolated;
     telemetry.speaking = *speaking;
     taskEXIT_CRITICAL(&state_lock);
 
-    if (completed != TEST_TONE_ID) {
+    if (completed != TEST_TONE_ID && completed != WAKE_CUE_ID) {
         send_event(drained ? UP_PLAY_DONE : UP_PLAY_ABORT, completed, DIR_UNKNOWN);
     }
+    int gain = atomic_load(&volume);
     for (int i = 0; i < frame; ++i) {
         if (tone_active && tone + i < 8000) {
             unsigned phase = (tone + i) % 32;
             int triangle = phase < 16 ? (int)phase : 32 - (int)phase;
             outgoing[i] = (int16_t)((triangle - 8) * 560);
         }
-        int32_t sample = outgoing[i] * robot_config.volume / 100;
+        int32_t sample = outgoing[i] * gain / 100;
         i2s_tx[i * 2] = i2s_tx[i * 2 + 1] = sample * 65536;
     }
 }
@@ -322,30 +432,43 @@ static bool keyword_detected(const int16_t *pcm)
     return detected;
 }
 
+static void audio_io_fault(bool output, uint32_t capture)
+{
+    taskENTER_CRITICAL(&state_lock);
+    if (output) ++telemetry.i2s_tx_errors;
+    else ++telemetry.i2s_rx_errors;
+    bool cancel = capture || play.active;
+    taskEXIT_CRITICAL(&state_lock);
+    if (capture) send_event(UP_ABORT, capture, DIR_UNKNOWN);
+    if (cancel) interrupt_audio(PLAYBACK_I2S_ERROR);
+}
+
 static void audio_task(void *unused)
 {
     (void)unused;
     unsigned ring = 0, ring_size = 0, seen_reset = 0;
-    int loud_ms = 0, quiet_ms = 0, capture_ms = 0, speech_ms = 0;
+    int quiet_ms = 0, capture_ms = 0, speech_ms = 0;
     int block_ms = frame * 1000 / SAMPLE_RATE;
-    int64_t echo_until = 0, next_wake = 0, direction_at = 0;
+    int64_t echo_until = 0, isolated_until = 0, next_wake = 0, direction_at = 0;
+    int64_t barge_voice_at = 0;
     direction_t last_direction = DIR_UNKNOWN;
     bool was_speaking = false;
+    bool followup = false;
+    direction_t wake_direction = DIR_UNKNOWN;
+    unsigned direction_votes[DIR_RIGHT + 1] = {0};
     uint32_t active = 0;
     while (true) {
         size_t bytes = 0;
         if (i2s_channel_read(rx, i2s_rx, frame * 8, &bytes, 100) != ESP_OK || bytes != frame * 8) {
-            if (active) send_event(UP_ABORT, active, DIR_UNKNOWN);
-            audio_interrupt();
+            audio_io_fault(false, active);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        int64_t now = esp_timer_get_time(), play_start;
-        bool speaking;
-        fill_output(now, &speaking, &play_start);
+        int64_t now = esp_timer_get_time();
+        bool playing, speaking, isolated;
+        fill_output(now, &playing, &speaking, &isolated);
         if (i2s_channel_write(tx, i2s_tx, frame * 8, &bytes, 40) != ESP_OK || bytes != frame * 8) {
-            if (active) send_event(UP_ABORT, active, DIR_UNKNOWN);
-            audio_interrupt();
+            audio_io_fault(true, active);
             continue;
         }
 
@@ -360,15 +483,17 @@ static void audio_task(void *unused)
         }
         // Playback reference and microphone samples share one I2S clock.
         if (aec) aec_process(aec, mono, reference, clean);
-        if (was_speaking && !speaking) echo_until = now + 90000;
+        if (was_speaking && !speaking) echo_until = now + ECHO_TAIL_US;
         was_speaking = speaking;
+        if (isolated) isolated_until = now + ECHO_TAIL_US;
+        bool allow_voice_trigger = now >= isolated_until;
         bool echo_path = speaking || now < echo_until;
         const int16_t *voice = echo_path && aec ? clean : mono;
         int level = pcm_rms(voice, frame);
         bool speech_like = signal_is_speech(voice);
         int left = pcm_rms(mic_l, frame), right = pcm_rms(mic_r, frame);
         bool ready = network_ready();
-        bool forced;
+        listen_mode_t forced;
         uint32_t old = 0;
         bool reset = false;
         taskENTER_CRITICAL(&state_lock);
@@ -376,9 +501,10 @@ static void audio_task(void *unused)
             seen_reset = reset_capture;
             reset = true;
             old = interrupted_id;
+            interrupted_id = 0;
         }
         forced = force_listen;
-        force_listen = false;
+        force_listen = LISTEN_NONE;
         telemetry.left_rms = left;
         telemetry.right_rms = right;
         telemetry.speech_rms = level;
@@ -387,17 +513,34 @@ static void audio_task(void *unused)
             if (active) send_event(UP_ABORT, active, DIR_UNKNOWN);
             if (old) send_event(UP_INTERRUPT, old, DIR_UNKNOWN);
             active = 0;
-            loud_ms = 0;
+            followup = false;
+            barge_voice_at = 0;
             ring_size = 0;
-            if (wake_data) wake->clean(wake_data);
             wake_used = 0;
+            next_wake = now + WAKE_DRAIN_US;
         }
 
         memcpy(preroll[ring], voice, frame * 2);
         ring = (ring + 1) % PREROLL;
         if (ring_size < PREROLL) ++ring_size;
 
+        direction_t frame_direction = DIR_UNKNOWN;
+        if (!echo_path && speech_like && left > 12 && right > 12 && level >= robot_config.vad_rms) {
+            frame_direction = estimate_direction(mic_l, mic_r, frame, robot_config.mic_spacing_mm);
+            if (frame_direction != DIR_UNKNOWN) {
+                last_direction = frame_direction;
+                direction_at = now;
+            }
+        }
+        direction_t live_direction = direction_at && now - direction_at < 950000 ?
+                                     last_direction : DIR_UNKNOWN;
+        taskENTER_CRITICAL(&state_lock);
+        telemetry.direction = !echo_path ? live_direction : DIR_UNKNOWN;
+        taskEXIT_CRITICAL(&state_lock);
+
         if (active) {
+            ++direction_votes[frame_direction];
+            if (now < next_wake) keyword_detected(wake_silence);
             capture_ms += block_ms;
             if (speech_like && level >= robot_config.vad_rms) {
                 speech_ms += block_ms;
@@ -406,56 +549,69 @@ static void audio_task(void *unused)
                 quiet_ms += block_ms;
             }
             bool uploaded = ready && send_pcm(active, voice);
-            int silence = speech_ms < 130 ? 2200 : 670;
+            int silence = speech_ms < 130 ? 2200 : 420;
             if (!uploaded || quiet_ms >= silence || capture_ms >= 11900) {
                 taskENTER_CRITICAL(&state_lock);
                 telemetry.listening = false;
                 bool same = turn_id == active;
                 taskEXIT_CRITICAL(&state_lock);
-                if (!same || !uploaded || speech_ms < 130 || !send_event(UP_END, active, DIR_UNKNOWN)) {
+                if (!same || !uploaded || speech_ms < 130 ||
+                    !send_event(UP_END, active, speech_direction(direction_votes))) {
                     send_event(UP_ABORT, active, DIR_UNKNOWN);
                     audio_cancel_turn(active);
                 }
                 active = 0;
-                loud_ms = 0;
                 ring_size = 0;
                 next_wake = now + 350000;
             }
             continue;
         }
 
-        if (!echo_path && speech_like && left > 12 && right > 12 && level >= robot_config.vad_rms) {
-            direction_t direction = estimate_direction(mic_l, mic_r, frame, robot_config.mic_spacing_mm);
-            if (direction != DIR_UNKNOWN) {
-                last_direction = direction;
-                direction_at = now;
-            }
+        // Drain the model's previous audio through its input. The ESP-SR
+        // clean callback can dereference a null queue in the WakeNet9 build.
+        bool can_barge = ready && playing && !isolated && robot_config.barge && (!echo_path || aec);
+        if (!can_barge) {
+            barge_voice_at = 0;
+        } else if (speech_like && level >= robot_config.barge_rms + pcm_rms(reference, frame) / 2) {
+            barge_voice_at = now;
         }
-        bool keyword = now >= next_wake && (!echo_path || aec) && keyword_detected(voice);
-        int threshold = robot_config.barge_rms + pcm_rms(reference, frame) / 12;
-        bool barge = robot_config.barge && echo_path && aec && speech_like &&
-                     level >= threshold && (!speaking || now - play_start >= 100000);
-        loud_ms = barge ? loud_ms + block_ms : 0;
-        if (forced || keyword || loud_ms >= 96) {
-            direction_t direction = !echo_path && direction_at && now - direction_at < 700000 ?
-                                    last_direction : DIR_UNKNOWN;
+        // Residual speaker echo can look like speech to VAD. During playback it
+        // may corroborate a wake word, but it never interrupts on its own.
+        bool check_keyword = allow_voice_trigger && now >= next_wake &&
+                             (can_barge || (!playing && !echo_path));
+        bool keyword = keyword_detected(check_keyword ? voice : wake_silence) && check_keyword;
+        if (playing && keyword) {
+            keyword = barge_voice_at && now - barge_voice_at <= BARGE_VOICE_WINDOW_US;
+        }
+        bool after_cue = followup && !speaking && allow_voice_trigger;
+        if (forced || keyword || after_cue) {
+            direction_t direction = after_cue ? wake_direction : (!echo_path ? live_direction : DIR_UNKNOWN);
+            bool acknowledge = keyword && !forced && !echo_path && !after_cue && audio_volume() > 0;
+            followup = false;
             uint32_t previous;
             taskENTER_CRITICAL(&state_lock);
             telemetry.direction = direction;
             previous = turn_id;
-            clear_play();
+            clear_play(forced ? PLAYBACK_MANUAL : PLAYBACK_WAKE_WORD);
             turn_id = 0;
-            if (ready) {
-                if (++next_id > INT32_MAX) next_id = 1;
-                active = turn_id = next_id;
+            if (ready && !acknowledge) {
+                active = turn_id = next_turn_locked();
                 telemetry.listening = true;
             }
             taskEXIT_CRITICAL(&state_lock);
             nav_stop(false);
             if (previous || echo_path) send_event(UP_INTERRUPT, previous, DIR_UNKNOWN);
-            if (ready) {
-                bool ok = send_event(UP_WAKE, active, direction);
-                if (!forced) {
+            if (acknowledge) {
+                audio_wake_feedback();
+                followup = ready;
+                wake_direction = direction;
+            } else if (ready) {
+                memset(direction_votes, 0, sizeof(direction_votes));
+                ++direction_votes[frame_direction];
+                uplink_t wake_packet = {.type = UP_WAKE, .id = active, .direction = direction,
+                                        .asr_only = forced == LISTEN_ASR_ONLY};
+                bool ok = cloud_uplink(&wake_packet);
+                if (!forced && !after_cue) {
                     for (unsigned i = 0; ok && i < ring_size; ++i) {
                         unsigned index = (ring + PREROLL - ring_size + i) % PREROLL;
                         ok = send_pcm(active, preroll[index]);
@@ -466,21 +622,21 @@ static void audio_task(void *unused)
                     audio_cancel_turn(active);
                     active = 0;
                 }
-                capture_ms = forced ? 0 : (int)ring_size * block_ms;
+                capture_ms = (forced || after_cue) ? 0 : (int)ring_size * block_ms;
                 quiet_ms = 0;
                 speech_ms = 0;
             }
-            if (wake_data) wake->clean(wake_data);
             wake_used = 0;
-            loud_ms = 0;
+            barge_voice_at = 0;
             ring_size = 0;
-            next_wake = now + 950000;
+            next_wake = now + WAKE_DRAIN_US;
         }
     }
 }
 
 bool audio_start(void)
 {
+    audio_set_volume(robot_config.volume);
     aec_config_t echo = {
         .mic_num = 1, .ref_num = 1, .out_num = 1, .filter_length = 4, .sample_rate = SAMPLE_RATE,
         .caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, .mode = AEC_MODE_FD_LOW_COST,
@@ -492,8 +648,11 @@ bool audio_start(void)
     frame = aec ? aec_get_chunksize(aec) : 256;
     if (frame <= 0 || frame > MAX_FRAME) return false;
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan.dma_desc_num = 3;
-    chan.dma_frame_num = frame;
+    // Stereo 32-bit samples take 8 bytes. A 512-sample AEC block does
+    // not fit a 4092-byte descriptor, so use two equal 256-sample buffers.
+    bool split_dma_block = frame * 8 > 4092;
+    chan.dma_desc_num = split_dma_block ? 6 : 3;
+    chan.dma_frame_num = split_dma_block ? frame / 2 : frame;
     chan.auto_clear_after_cb = true;
     if (i2s_new_channel(&chan, &tx, &rx) != ESP_OK) return false;
     i2s_std_config_t config = {
@@ -520,6 +679,7 @@ bool audio_start(void)
         taskEXIT_CRITICAL(&state_lock);
         return false;
     }
-    ESP_LOGI("audio", "Dual INMP441, %d-sample frames, AEC %s", frame, aec ? "ready" : "unavailable");
+    ESP_LOGI("audio", "Dual INMP441, %d-sample frames, %lu-sample DMA, AEC %s",
+             frame, (unsigned long)chan.dma_frame_num, aec ? "ready" : "unavailable");
     return true;
 }

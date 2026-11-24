@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 enum {
+    PIN_BOOT = 0,
     PIN_BCLK = 4, PIN_WS = 5, PIN_MIC = 6, PIN_SPEAKER = 7,
     PIN_TRIG = 8, PIN_ECHO = 9,
     PIN_LF_A = 10, PIN_LF_B = 11, PIN_RF_A = 12, PIN_RF_B = 13,
@@ -15,6 +16,10 @@ typedef enum { SRC_NAV = 1, SRC_CLOUD, SRC_WEB } motion_source_t;
 typedef enum { STOP, FORWARD, BACK, LEFT, RIGHT, WIGGLE } action_t;
 typedef enum { DIR_UNKNOWN, DIR_LEFT, DIR_CENTER, DIR_RIGHT } direction_t;
 typedef enum { MOTION_IDLE, MOTION_RUNNING, MOTION_DONE, MOTION_ABORTED } motion_result_t;
+typedef enum {
+    PLAYBACK_NONE, PLAYBACK_COMPLETE, PLAYBACK_WAKE_WORD, PLAYBACK_MANUAL,
+    PLAYBACK_I2S_ERROR, PLAYBACK_TIMEOUT, PLAYBACK_NETWORK_LOST, PLAYBACK_CLOUD_ERROR,
+} playback_result_t;
 
 typedef struct {
     char ssid[33], password[65], api_key[161], console_key[25], voice[10], profile[301];
@@ -23,19 +28,23 @@ typedef struct {
     int vad_rms, barge_rms, mic_spacing_mm, volume, ref_delay;
     bool history, barge;
     uint32_t wake_choice;
+    char ap_password[64];
 } robot_config_t;
 
 typedef struct {
     int cm;
     bool valid, blocked, armed, moving;
     uint32_t measurement, ticket;
+    int echo_us, sample_age_ms, wheel, pwm, duration_ms;
     motion_result_t result;
-    action_t action;
+    action_t action, last_action;
 } motion_status_t;
 
 typedef struct {
     int left_rms, right_rms, speech_rms;
+    uint32_t i2s_rx_errors, i2s_tx_errors, playback_underruns, wake_cue;
     direction_t direction;
+    playback_result_t playback_result;
     bool listening, speaking, aec, wake_ready;
 } audio_status_t;
 
@@ -45,6 +54,7 @@ typedef struct {
     uint32_t id;
     uint16_t bytes;
     direction_t direction;
+    bool asr_only;
     int16_t pcm[MAX_FRAME];
 } uplink_t;
 
@@ -68,22 +78,30 @@ extern const unsigned wake_option_count;
 const wake_option_t *audio_selected_wake(void);
 bool audio_start(void);
 audio_status_t audio_status(void);
-bool audio_begin_play(uint32_t id);
-bool audio_push_play(const void *data, size_t size);
+void audio_set_volume(int volume);
+int audio_volume(void);
+bool audio_begin_play(uint32_t id, bool isolated);
+bool audio_push_play(uint32_t id, const void *data, size_t size);
 void audio_end_play(uint32_t id);
 void audio_interrupt(void);
+void audio_network_lost(void);
 void audio_cancel_turn(uint32_t id);
 bool audio_turn_is_current(uint32_t id);
 bool audio_test_tone(void);
-bool audio_listen_once(void);
+bool audio_wake_feedback(void);
+bool audio_listen_once(bool asr_only);
+uint32_t audio_begin_debug_turn(void);
 const char *direction_name(direction_t direction);
+const char *playback_result_name(playback_result_t result);
 int pcm_rms(const int16_t *pcm, size_t count);
 direction_t estimate_direction(const int16_t *left, const int16_t *right, int count, int spacing_mm);
+direction_t speech_direction(const unsigned votes[DIR_RIGHT + 1]);
 
 void network_load_config(void);
 void network_start(void);
 bool network_ready(void);
 bool network_wifi_up(void);
+bool network_change_volume(int amount, bool relative, int *applied);
 
 void cloud_start(void);
 bool cloud_uplink(const uplink_t *packet);

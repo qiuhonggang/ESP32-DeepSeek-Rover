@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
 set(IDF_TARGET esp32s3)
-set(PROJECT_VER "1.0.2")
+set(PROJECT_VER "1.0.7")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(deepseek_rover)

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "driver/gpio.h"
 #include "bootloader_random.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -16,8 +17,10 @@
 #include "esp_random.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -31,6 +34,7 @@ robot_config_t robot_config = {
 static esp_netif_t *station;
 static char ap_ssid[20];
 static atomic_bool wifi_up, rebooting;
+static SemaphoreHandle_t config_lock;
 static const char STORE[] = "rover_cfg";
 extern const char console_start[] asm("_binary_console_html_start");
 
@@ -49,7 +53,7 @@ static esp_err_t save_config(const robot_config_t *config)
     nvs_handle_t nvs;
     esp_err_t result = nvs_open(STORE, NVS_READWRITE, &nvs);
     if (result != ESP_OK) return result;
-    result = nvs_set_blob(nvs, "config-v2", config, sizeof(*config));
+    result = nvs_set_blob(nvs, "config-v3", config, sizeof(*config));
     if (result == ESP_OK) result = nvs_commit(nvs);
     nvs_close(nvs);
     return result;
@@ -57,20 +61,26 @@ static esp_err_t save_config(const robot_config_t *config)
 
 void network_load_config(void)
 {
+    config_lock = xSemaphoreCreateMutex();
+    assert(config_lock);
     nvs_handle_t nvs;
     if (nvs_open(STORE, NVS_READONLY, &nvs) == ESP_OK) {
         robot_config_t saved = robot_config;
         size_t length = sizeof(saved);
-        if (nvs_get_blob(nvs, "config-v2", &saved, &length) == ESP_OK && length == sizeof(saved)) {
+        if (nvs_get_blob(nvs, "config-v3", &saved, &length) == ESP_OK && length == sizeof(saved)) {
             robot_config = saved;
         } else {
-            // 1.0.0 ended before wake_choice. Read the exact legacy prefix
-            // and keep all existing credentials and tuning with the new default wake word.
             saved = robot_config;
-            length = offsetof(robot_config_t, wake_choice);
-            if (nvs_get_blob(nvs, "config-v1", &saved, &length) == ESP_OK &&
-                length == offsetof(robot_config_t, wake_choice)) {
+            length = offsetof(robot_config_t, ap_password);
+            if (nvs_get_blob(nvs, "config-v2", &saved, &length) == ESP_OK &&
+                length == offsetof(robot_config_t, ap_password)) {
                 robot_config = saved;
+            } else {
+                // The original configuration ended before wake_choice.
+                saved = robot_config;
+                length = offsetof(robot_config_t, wake_choice);
+                if (nvs_get_blob(nvs, "config-v1", &saved, &length) == ESP_OK &&
+                    length == offsetof(robot_config_t, wake_choice)) robot_config = saved;
             }
         }
         nvs_close(nvs);
@@ -87,6 +97,27 @@ void network_load_config(void)
     }
 }
 
+bool network_change_volume(int amount, bool relative, int *applied)
+{
+    xSemaphoreTake(config_lock, portMAX_DELAY);
+    int value = relative ? robot_config.volume + amount : amount;
+    if (value < 0) value = 0;
+    if (value > 75) value = 75;
+    bool ok = !atomic_load(&rebooting);
+    if (ok && value != robot_config.volume) {
+        robot_config_t config = robot_config;
+        config.volume = value;
+        ok = save_config(&config) == ESP_OK;
+        if (ok) {
+            robot_config.volume = value;
+            audio_set_volume(value);
+        }
+    }
+    if (ok && applied) *applied = value;
+    xSemaphoreGive(config_lock);
+    return ok;
+}
+
 bool network_wifi_up(void) { return atomic_load(&wifi_up); }
 static bool clock_ready(void) { return time(NULL) > 1700000000; }
 
@@ -99,11 +130,32 @@ static void connection_task(void *unused)
 {
     (void)unused;
     bool ap = true;
+    bool forced_setup = false;
     unsigned connected_seconds = 0, disconnected_seconds = 0;
+    int64_t pressed_at = 0, check_at = 0;
     while (true) {
+        int64_t now = esp_timer_get_time();
+        if (gpio_get_level(PIN_BOOT)) {
+            pressed_at = 0;
+        } else if (!pressed_at) {
+            pressed_at = now;
+        } else if (!forced_setup && now - pressed_at >= 3000000) {
+            forced_setup = true;
+            nav_stop(true);
+            audio_interrupt();
+            ESP_LOGI(TAG, "BOOT requested provisioning at http://192.168.4.1");
+            check_at = now;
+        }
+        if (now < check_at) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        check_at = now + 1000000;
+        if (forced_setup && !ap && esp_wifi_set_mode(WIFI_MODE_APSTA) == ESP_OK) ap = true;
         if (network_wifi_up()) {
             disconnected_seconds = 0;
-            if (++connected_seconds >= 6 && ap && esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) ap = false;
+            if (++connected_seconds >= 6 && !forced_setup && ap &&
+                esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) ap = false;
             if (connected_seconds > 6) connected_seconds = 6;
         } else {
             connected_seconds = 0;
@@ -111,7 +163,7 @@ static void connection_task(void *unused)
             if (disconnected_seconds > 12) disconnected_seconds = 12;
             if (robot_config.ssid[0] && disconnected_seconds % 3 == 0) esp_wifi_connect();
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -119,10 +171,11 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t event, void *da
 {
     (void)arg;
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_START && robot_config.ssid[0]) esp_wifi_connect();
+    if (base == WIFI_EVENT && event == WIFI_EVENT_AP_START) ESP_LOGI(TAG, "Provisioning AP active: %s", ap_ssid);
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_DISCONNECTED) {
         if (atomic_exchange(&wifi_up, false)) {
             nav_stop(true);
-            audio_interrupt();
+            audio_network_lost();
         }
     }
     if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP) {
@@ -227,9 +280,27 @@ static esp_err_t get_status(httpd_req_t *req)
         cJSON_AddBoolToObject(json, "blocked", chassis.blocked);
         cJSON_AddNumberToObject(json, "cm", chassis.cm);
         cJSON_AddStringToObject(json, "action", action_name(chassis.action));
+        cJSON_AddNumberToObject(json, "measurement", chassis.measurement);
+        cJSON_AddNumberToObject(json, "echo_us", chassis.echo_us);
+        cJSON_AddNumberToObject(json, "sample_age_ms", chassis.sample_age_ms);
+        cJSON_AddNumberToObject(json, "stop_cm", robot_config.stop_cm);
+        cJSON *motor = cJSON_AddObjectToObject(json, "motor");
+        const char *results[] = {"idle", "running", "done", "aborted"};
+        cJSON_AddStringToObject(motor, "result", results[chassis.result]);
+        cJSON_AddNumberToObject(motor, "ticket", chassis.ticket);
+        cJSON_AddStringToObject(motor, "action", action_name(chassis.last_action));
+        cJSON_AddNumberToObject(motor, "wheel", chassis.wheel);
+        cJSON_AddNumberToObject(motor, "pwm", chassis.pwm);
+        cJSON_AddNumberToObject(motor, "duration_ms", chassis.duration_ms);
         cJSON_AddNumberToObject(json, "left_rms", audio.left_rms);
         cJSON_AddNumberToObject(json, "right_rms", audio.right_rms);
         cJSON_AddNumberToObject(json, "speech_rms", audio.speech_rms);
+        cJSON_AddNumberToObject(json, "i2s_rx_errors", audio.i2s_rx_errors);
+        cJSON_AddNumberToObject(json, "i2s_tx_errors", audio.i2s_tx_errors);
+        cJSON_AddNumberToObject(json, "playback_underruns", audio.playback_underruns);
+        cJSON_AddStringToObject(json, "playback_result", playback_result_name(audio.playback_result));
+        cJSON_AddNumberToObject(json, "wake_cue", audio.wake_cue);
+        cJSON_AddNumberToObject(json, "volume", audio_volume());
         cJSON_AddStringToObject(json, "doa", direction_name(audio.direction));
         cJSON_AddBoolToObject(json, "listening", audio.listening);
         cJSON_AddBoolToObject(json, "speaking", audio.speaking);
@@ -264,9 +335,12 @@ static esp_err_t get_config(httpd_req_t *req)
         cJSON_AddBoolToObject(json, "barge", robot_config.barge);
         cJSON_AddBoolToObject(json, "has_api_key", robot_config.api_key[0]);
         cJSON_AddBoolToObject(json, "has_password", robot_config.password[0]);
-        for (int i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
+        cJSON_AddBoolToObject(json, "has_ap_password", robot_config.ap_password[0]);
+        xSemaphoreTake(config_lock, portMAX_DELAY);
+        for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
             cJSON_AddNumberToObject(json, settings[i].name, *tuning_value(&robot_config, &settings[i]));
         }
+        xSemaphoreGive(config_lock);
         cJSON_AddItemToObject(json, "polarity", cJSON_CreateIntArray(robot_config.polarity, 4));
     }
     return send_json(req, json);
@@ -297,8 +371,13 @@ static bool apply_config(cJSON *json, robot_config_t *next)
         !read_field(json, "password", next->password, sizeof(next->password)) ||
         !read_field(json, "api_key", next->api_key, sizeof(next->api_key)) ||
         !read_field(json, "profile", next->profile, sizeof(next->profile)) ||
+        !read_field(json, "ap_password", next->ap_password, sizeof(next->ap_password)) ||
         !read_field(json, "voice", next->voice, sizeof(next->voice))) return false;
     if (next->password[0] && strlen(next->password) < 8) return false;
+    if (next->ap_password[0] && strlen(next->ap_password) < 8) return false;
+    for (const unsigned char *c = (const unsigned char *)next->ap_password; *c; ++c) {
+        if (*c < 32 || *c > 126) return false;
+    }
     int wake_choice = get_int(json, "wake_choice",
                               cJSON_HasObjectItem(json, "wake_choice") ? -1 : (int)next->wake_choice);
     if (wake_choice < 0 || (unsigned)wake_choice >= wake_option_count) return false;
@@ -334,20 +413,30 @@ static void restart_task(void *unused)
 static esp_err_t post_config(httpd_req_t *req)
 {
     if (!authorize(req)) return ESP_OK;
-    if (atomic_load(&rebooting)) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Already restarting");
     cJSON *json = read_json(req);
+    xSemaphoreTake(config_lock, portMAX_DELAY);
+    if (atomic_load(&rebooting)) {
+        xSemaphoreGive(config_lock);
+        cJSON_Delete(json);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Already restarting");
+    }
     robot_config_t next = robot_config;
     bool valid = apply_config(json, &next);
     cJSON_Delete(json);
-    if (!valid) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Wi-Fi, API key or tuning value");
+    if (!valid) {
+        xSemaphoreGive(config_lock);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Wi-Fi, API key or tuning value");
+    }
     atomic_store(&rebooting, true);
     nav_stop(true);
     audio_interrupt();
     if (save_config(&next) != ESP_OK ||
         xTaskCreate(restart_task, "restart", 2048, NULL, 3, NULL) != pdPASS) {
         atomic_store(&rebooting, false);
+        xSemaphoreGive(config_lock);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save or restart");
     }
+    xSemaphoreGive(config_lock);
     return httpd_resp_sendstr(req, "saved");
 }
 
@@ -368,7 +457,21 @@ static bool control(const cJSON *json)
     }
     if (!strcmp(cmd, "arm")) return motion_arm();
     if (!strcmp(cmd, "tone")) return audio_test_tone();
-    if (!strcmp(cmd, "listen")) return audio_listen_once();
+    if (!strcmp(cmd, "wake_feedback")) return audio_wake_feedback();
+    if (!strcmp(cmd, "volume")) {
+        int value = get_int(json, "value", -1);
+        return value >= 0 && value <= 75 && network_change_volume(value, false, NULL);
+    }
+    if (!strcmp(cmd, "listen") || !strcmp(cmd, "debug_asr")) {
+        return audio_listen_once(!strcmp(cmd, "debug_asr"));
+    }
+    if (!strcmp(cmd, "debug_chat") || !strcmp(cmd, "debug_tts") || !strcmp(cmd, "debug_stream")) {
+        return cloud_debug_text(get_text(json, "text"), cmd);
+    }
+    if (!strcmp(cmd, "stop_audio")) {
+        audio_interrupt();
+        return true;
+    }
     if (!strcmp(cmd, "calibrate")) return nav_calibrate(action_from_name(get_text(json, "action")));
     if (!strcmp(cmd, "origin")) return nav_set_origin(get_bool(json, "clear"), get_int(json, "heading", NORTH));
     if (!strcmp(cmd, "explore")) return nav_explore();
@@ -400,6 +503,12 @@ static esp_err_t get_memory(httpd_req_t *req)
 
 void network_start(void)
 {
+    const gpio_config_t button = {
+        .pin_bit_mask = 1ULL << PIN_BOOT,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&button));
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     station = esp_netif_create_default_wifi_sta();
@@ -415,7 +524,8 @@ void network_start(void)
     snprintf(ap_ssid, sizeof(ap_ssid), "DeepSeekRover-%02X%02X", mac[4], mac[5]);
     wifi_config_t ap = {.ap = {.max_connection = 3, .channel = 6, .authmode = WIFI_AUTH_WPA2_PSK}};
     strlcpy((char *)ap.ap.ssid, ap_ssid, sizeof(ap.ap.ssid));
-    strlcpy((char *)ap.ap.password, robot_config.console_key, sizeof(ap.ap.password));
+    const char *ap_password = robot_config.ap_password[0] ? robot_config.ap_password : robot_config.console_key;
+    strlcpy((char *)ap.ap.password, ap_password, sizeof(ap.ap.password));
     wifi_config_t wifi = {0};
     memcpy(wifi.sta.ssid, robot_config.ssid, strlen(robot_config.ssid));
     memcpy(wifi.sta.password, robot_config.password, strlen(robot_config.password));

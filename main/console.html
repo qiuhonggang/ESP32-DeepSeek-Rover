@@ -25,6 +25,18 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 .legend{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:14px;color:var(--muted);margin:8px 0}
 .marker{display:inline-block;width:10px;height:10px;margin-right:4px;border-radius:2px}
 #memory_log{white-space:pre-wrap;margin-top:10px;color:var(--muted);overflow-wrap:anywhere}
+.diagnostic-heading{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.diagnostic-heading p{margin:0;color:var(--mint);font-size:14px}
+.reading{display:block;font-size:clamp(24px,6vw,36px);font-variant-numeric:tabular-nums;color:var(--mint);margin:0 0 4px}
+.samples{min-height:3em;color:var(--muted);overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.test-input{margin:10px 0}
+.test-input textarea{resize:vertical}
+.test-group{margin-top:12px}
+.test-group h3{font-size:15px;margin:0 0 7px}
+.mic-test{margin:12px 0;padding:9px 0;border-top:1px solid var(--line)}
+.mic-test meter{width:100%;height:16px;accent-color:var(--mint)}
+.volume-control{margin:10px 0}
+.volume-control input{padding:0;accent-color:var(--mint)}
 .small{font-size:14px}[hidden]{display:none!important}
 </style>
 </head>
@@ -42,23 +54,48 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 <div id="notice" role="status" aria-live="polite"></div>
 <div id="panel" hidden>
   <div class="columns">
-    <section>
-      <h2>状态与语音</h2>
+    <section aria-labelledby="voice_heading">
+      <div class="diagnostic-heading">
+        <h2 id="voice_heading">语音与对话调试</h2>
+        <p id="debug_link">正在读取设备</p>
+      </div>
       <dl>
         <dt>局域网</dt><dd id="ip">—</dd>
         <dt>云端</dt><dd id="cloud">—</dd>
-        <dt>前向测距</dt><dd id="sonar">—</dd>
-        <dt>四轮驱动</dt><dd id="motion">—</dd>
-        <dt>双麦与方向</dt><dd id="mic">—</dd>
         <dt>唤醒与回声</dt><dd id="wake">—</dd>
-        <dt>转写</dt><dd id="transcript">—</dd>
-        <dt>回复</dt><dd id="reply">—</dd>
+        <dt>音频诊断</dt><dd id="audio_io">—</dd>
+        <dt>上次播报结束原因</dt><dd id="playback_result">—</dd>
+        <dt>转写或输入</dt><dd id="transcript">—</dd>
+        <dt>本轮硬件读数</dt><dd id="turn_hardware">—</dd>
+        <dt>回复或播报文本</dt><dd id="reply">—</dd>
+        <dt>流式对话耗时</dt><dd id="stream_timings">—</dd>
       </dl>
       <div class="row">
-        <button data-command="arm" class="primary">启用电机</button>
-        <button data-command="emergency" class="danger">急停并锁定</button>
         <button data-command="listen">手动听一句</button>
+        <button data-command="debug_asr">只测语音识别</button>
         <button data-command="tone">喇叭测试音</button>
+        <button data-command="wake_feedback">测试唤醒应答</button>
+        <button data-command="stop_audio">停止语音</button>
+      </div>
+      <label class="volume-control">播报音量 <output id="volume_display" for="live_volume">—</output>
+        <input id="live_volume" type="range" min="0" max="75" value="28">
+      </label>
+      <div class="mic-test test-group">
+        <h3>双麦测试</h3>
+        <p class="small">站到小车左侧或右侧说一句，观察下面的电平和方位。</p>
+        <div class="fields">
+          <label>左麦 <span id="mic_left">—</span><meter id="mic_left_meter" min="0" max="4096" value="0"></meter></label>
+          <label>右麦 <span id="mic_right">—</span><meter id="mic_right_meter" min="0" max="4096" value="0"></meter></label>
+        </div>
+        <p>说话方位 <strong id="mic_direction">—</strong></p>
+      </div>
+      <label class="test-input">测试文字
+        <textarea id="debug_text" maxlength="80" rows="2" placeholder="例如 你好，讲一个小兔子的故事"></textarea>
+      </label>
+      <div class="row">
+        <button data-command="debug_stream">测试流式对话和播报</button>
+        <button data-command="debug_chat">只测 Flash 文字对话</button>
+        <button data-command="debug_tts">只测 TTS 播报</button>
       </div>
     </section>
     <section>
@@ -84,18 +121,62 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       <div id="places" class="row"></div>
     </section>
   </div>
+  <div class="columns">
+    <section aria-labelledby="sonar_heading">
+      <h2 id="sonar_heading">超声波测距调试</h2>
+      <strong id="sonar" class="reading">—</strong>
+      <dl>
+        <dt>避障状态</dt><dd id="sonar_gate">—</dd>
+        <dt>回波脉宽</dt><dd id="sonar_echo">—</dd>
+        <dt>采样编号</dt><dd id="sonar_seq">—</dd>
+        <dt>急停距离</dt><dd id="sonar_limit">—</dd>
+      </dl>
+      <div class="test-group">
+        <h3>最近 12 次网页采样（新到旧）</h3>
+        <p id="sonar_samples" class="samples">—</p>
+        <button id="clear_sonar" type="button">清空采样</button>
+      </div>
+    </section>
+    <section aria-labelledby="motor_heading">
+      <h2 id="motor_heading">电机调试</h2>
+      <dl>
+        <dt>当前状态</dt><dd id="motion">—</dd>
+        <dt>上次指令</dt><dd id="motor_last">—</dd>
+      </dl>
+      <div class="row">
+        <button data-command="arm" class="primary">启用电机</button>
+        <button data-command="emergency" class="danger">急停并锁定</button>
+      </div>
+      <div class="test-group">
+        <h3>单轮点动</h3>
+        <p class="small">先架空四轮。点一次只发一个短脉冲，电机仍受本地保护约束。</p>
+        <div class="fields">
+          <label>点动方向<select id="test_direction"><option value="move_forward">正向</option><option value="move_backward">反向</option></select></label>
+          <label>点动 PWM<input id="test_pwm" type="number" min="65" max="180" value="105" required></label>
+          <label>时长（ms）<input id="test_ms" type="number" min="80" max="240" value="180" required></label>
+        </div>
+        <div class="row test-group">
+          <button data-wheel="0" data-command="wheel_test">左前</button>
+          <button data-wheel="1" data-command="wheel_test">右前</button>
+          <button data-wheel="2" data-command="wheel_test">左后</button>
+          <button data-wheel="3" data-command="wheel_test">右后</button>
+        </div>
+      </div>
+      <div class="test-group">
+        <h3>整车短动</h3>
+        <div class="row">
+          <button data-drive data-command="move_forward">短前进</button>
+          <button data-drive data-command="move_backward">短后退</button>
+          <button data-drive data-command="turn_left">短左转</button>
+          <button data-drive data-command="turn_right">短右转</button>
+        </div>
+      </div>
+    </section>
+  </div>
   <details>
-    <summary>底盘校准与单轮测试</summary>
-    <p>架空轮组，先验证每个电机的方向。做格距和转角校准时再把车放到平整地面。</p>
+    <summary>底盘校准与地图起点</summary>
+    <p>做格距和转角校准时，把车放到平整地面。</p>
     <div class="row">
-      <button data-wheel="0" data-command="move_forward">左前</button>
-      <button data-wheel="1" data-command="move_forward">右前</button>
-      <button data-wheel="2" data-command="move_forward">左后</button>
-      <button data-wheel="3" data-command="move_forward">右后</button>
-      <button data-command="move_forward">前进</button>
-      <button data-command="move_backward">短后退</button>
-      <button data-command="turn_left">左转</button>
-      <button data-command="turn_right">右转</button>
       <button data-cal="move_forward" data-command="calibrate">标定走一格</button>
       <button data-cal="turn_left" data-command="calibrate">标定左转 90°</button>
       <button data-cal="turn_right" data-command="calibrate">标定右转 90°</button>
@@ -113,6 +194,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       <div class="fields">
         <label>2.4 GHz Wi-Fi 名称<input name="ssid" maxlength="32" autocomplete="off"></label>
         <label>Wi-Fi 密码<input name="password" type="password" maxlength="64" autocomplete="new-password"></label>
+        <label>小车配网热点密码<input name="ap_password" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="留空保留现有密码"></label>
         <label>DeepSeek API 密钥<input name="api_key" type="password" maxlength="160" autocomplete="new-password"></label>
         <label>本地唤醒词<select name="wake_choice"></select></label>
         <label>TTS 音色<select name="voice"><option value="stella">海星 · 女声</option><option value="tide">暗潮 · 男声</option></select></label>
@@ -122,7 +204,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
         <label class="check"><input type="checkbox" name="clear_password">清除 Wi-Fi 密码</label>
         <label class="check"><input type="checkbox" name="clear_key">清除 API 密钥</label>
         <label class="check"><input type="checkbox" name="history">保存近期对话</label>
-        <label class="check"><input type="checkbox" name="barge">播报时允许插话</label>
+        <label class="check"><input type="checkbox" name="barge">播报时可用当前唤醒词打断</label>
       </div>
       <details>
         <summary>测距、电机和声音</summary>
@@ -136,7 +218,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
           <label>格边长（cm）<input name="cell_cm" type="number" min="20" max="45" required></label>
           <label>麦克风间距（mm）<input name="mic_spacing_mm" type="number" min="40" max="220" required></label>
           <label>收音门限（RMS）<input name="vad_rms" type="number" min="50" max="3500" required></label>
-          <label>打断门限（RMS）<input name="barge_rms" type="number" min="80" max="4500" required></label>
+          <label>播报中唤醒门限（RMS）<input name="barge_rms" type="number" min="80" max="4500" required></label>
           <label>播报音量（%）<input name="volume" type="number" min="0" max="75" required></label>
           <label>回声参考延迟帧<input name="ref_delay" type="number" min="0" max="3" required></label>
         </div>
@@ -164,6 +246,8 @@ const field = name => form.elements.namedItem(name);
 const canvas = byId('map'), pen = canvas.getContext('2d');
 const numeric = ['stop_cm','speed','nav_speed','step_ms','turn_left_ms','turn_right_ms','cell_cm','vad_rms','barge_rms','mic_spacing_mm','volume','ref_delay'];
 let key = '', online = false, pending = false, currentMap = null, selected = {x:10,y:10}, placesCache = '';
+let sonarHistory = [], lastMeasurement = null;
+let lastVolume = null, volumePending = false;
 try { key = sessionStorage.getItem('rover-key') || ''; } catch {}
 const headings = ['上','右','下','左'];
 const navLabels = {origin_required:'待校准起点',origin_set:'起点已对齐',stopped:'已停车',exploring:'正在探索',planning:'正在规划',
@@ -172,8 +256,17 @@ const navLabels = {origin_required:'待校准起点',origin_set:'起点已对齐
   locked:'电机已锁定',motion_timeout:'动作超时',motion_aborted:'动作中断',turn_blocked:'转向被拦截',
   motion_refused:'前进被拦截',navigation_timeout:'达到本轮时限'};
 const cloudLabels = {idle:'就绪',listening:'本地录音',asr:'DeepSeek 识别',flash:'Flash 生成',tts:'DeepSeek 合成',speaking:'播报中',
+  asr_done:'语音识别完成',flash_done:'Flash 文字测试完成',tts_done:'播报测试完成',
   interrupted:'已打断',audio_abort:'录音已取消',asr_error:'识别失败',flash_error:'Flash 失败',tts_error:'合成失败'};
+const cloudActive = new Set(['listening','asr','flash','tts','speaking']);
+const voiceCommands = new Set(['listen','tone','wake_feedback','stop_audio','debug_asr','debug_chat','debug_tts','debug_stream','volume']);
+const cloudTests = '[data-command=debug_asr],[data-command=debug_chat],[data-command=debug_tts],[data-command=debug_stream]';
+const wheels = ['左前','右前','左后','右后'];
+const actions = {move_forward:'前进',move_backward:'后退',turn_left:'左转',turn_right:'右转',happy_wiggle:'摇摆'};
+const motorResults = {idle:'空闲',running:'执行中',done:'已完成',aborted:'已中断'};
 const colors = {'.':'#5f8e80','#':'#c57d7e','?':'#1c373b'};
+const directions = {left:'左侧',right:'右侧',center:'中线附近'};
+const paces = {slow:'慢',normal:'正常',fast:'快'};
 function notice(message, error = false) {
   byId('notice').textContent = message;
   byId('notice').classList.toggle('error', error);
@@ -187,11 +280,15 @@ async function request(path, body) {
       headers:{'X-Console-Key':key,...(body ? {'Content-Type':'application/json'} : {})},
       body:body ? JSON.stringify(body) : undefined, cache:'no-store'});
     if (result.status === 401) throw new Error('控制台口令不正确。');
-    if (!result.ok) throw new Error(path === '/api/config' ? '保存失败，请检查各项参数。' : '请求被拒绝，请检查底盘状态。');
+    if (!result.ok) {
+      if (path === '/api/config') throw new Error('保存失败，请检查各项参数。');
+      if (voiceCommands.has(body?.cmd)) throw new Error('语音测试未启动，请检查音频和云端状态。');
+      throw new Error('请求被拒绝，请检查电机锁定、测距和导航状态。');
+    }
     return path.startsWith('/api/control') || body ? undefined : await result.json();
   } finally { clearTimeout(timer); }
 }
-for (const [i,wheel] of ['左前','右前','左后','右后'].entries()) {
+for (const [i,wheel] of wheels.entries()) {
   const label = document.createElement('label');
   label.textContent = wheel + '方向';
   const select = document.createElement('select');
@@ -201,6 +298,49 @@ for (const [i,wheel] of ['左前','右前','左后','右后'].entries()) {
   label.append(select);
   byId('polarity').append(label);
 }
+function buttons(selector, disabled) {
+  document.querySelectorAll(selector).forEach(button => button.disabled = disabled);
+}
+function renderSonar(s) {
+  show('sonar', s.valid ? s.cm + ' cm' : '无有效回波');
+  show('sonar_gate', !s.valid ? '测距无效 · 禁止前进' : s.blocked ? '障碍拦截 · 禁止前进' : '可前进');
+  show('sonar_echo', s.echo_us > 0 ? s.echo_us + ' µs' : '未收到回波');
+  show('sonar_seq', s.sample_age_ms >= 0 ? '#' + s.measurement + ' · ' + s.sample_age_ms + ' ms 前' : '待首次采样');
+  show('sonar_limit', s.stop_cm + ' cm');
+  if (s.sample_age_ms >= 0 && s.measurement !== lastMeasurement) {
+    if (lastMeasurement !== null && s.measurement < lastMeasurement) sonarHistory = [];
+    lastMeasurement = s.measurement;
+    sonarHistory = [s.valid ? s.cm + ' cm' : '无回波', ...sonarHistory].slice(0,12);
+    show('sonar_samples', sonarHistory.join(' · '));
+  }
+}
+function renderMotor(s) {
+  const motor = s.motor;
+  show('motion', s.armed ? (s.moving ? '运行中 · ' + (actions[s.action] || s.action) : '已启用') : '已锁定');
+  if (motor.ticket) {
+    const target = wheels[motor.wheel] || '整车';
+    const action = motor.wheel >= 0 ? (motor.action === 'move_backward' ? '反向' : '正向') : actions[motor.action];
+    show('motor_last', '#' + motor.ticket + ' · ' + target + action + ' · PWM ' + motor.pwm + ' · ' +
+         motor.duration_ms + ' ms · ' + motorResults[motor.result]);
+  } else show('motor_last', '暂无指令');
+  const available = s.armed && motor.result !== 'running' && !s.moving && s.nav.mode === 'idle';
+  byId('test_direction').dataset.forwardBlocked = String(s.blocked || !s.valid);
+  byId('test_direction').dataset.motorAvailable = String(available);
+  updateWheelButtons();
+  buttons('[data-command=arm]', s.armed || motor.result === 'running' || !s.valid || s.blocked);
+  buttons('[data-drive],[data-cal]', !available);
+  if (available && (s.blocked || !s.valid)) buttons('[data-drive][data-command=move_forward],[data-cal=move_forward]', true);
+}
+function updateWheelButtons() {
+  const direction = byId('test_direction');
+  buttons('[data-command=wheel_test]', direction.dataset.motorAvailable !== 'true' ||
+          (direction.value === 'move_forward' && direction.dataset.forwardBlocked === 'true'));
+}
+byId('test_direction').addEventListener('change', updateWheelButtons);
+byId('clear_sonar').addEventListener('click', () => {
+  sonarHistory = [];
+  show('sonar_samples', '—');
+});
 function draw() {
   if (!currentMap) return;
   const size = canvas.width / currentMap.cells.length;
@@ -226,16 +366,45 @@ function draw() {
 }
 function render(s) {
   show('ip', s.wifi ? s.ip : '配置热点');
+  show('debug_link', '设备在线');
   const cloud = s.cloud;
+  const hardware = cloud.hardware;
+  show('turn_hardware', hardware ?
+    [directions[hardware.speech_direction] || '方位不确定',
+      hardware.front_cm == null ? '前方无读数' : '车头前方 ' + hardware.front_cm + ' cm',
+      '语音速度档 ' + paces[cloud.voice_pace]].join(' · ') : '—');
+  show('stream_timings', cloud.flash_first_ms || cloud.flash_complete_ms || cloud.tts_first_ms ?
+    [cloud.flash_first_ms && '首段文字 ' + cloud.flash_first_ms + ' ms',
+      cloud.flash_complete_ms && '文字完成 ' + cloud.flash_complete_ms + ' ms',
+      cloud.tts_first_ms && '首批音频 ' + cloud.tts_first_ms + ' ms'].filter(Boolean).join(' · ') : '—');
   if (!s.key_set) show('cloud', '待填写 API 密钥');
   else if (!s.wifi) show('cloud', '待连接 Wi-Fi');
   else if (!s.clock) show('cloud', '正在同步时钟');
-  else show('cloud', (cloudLabels[cloud.phase] || cloud.phase) + (cloud.http >= 400 ? ' · HTTP ' + cloud.http : ''));
-  show('sonar', s.valid ? s.cm + ' cm' + (s.blocked ? ' · 已拦截' : '') : '无有效回波');
-  show('motion', s.armed ? (s.moving ? '运行中 · '+s.action : '已启用') : '已锁定');
-  show('mic', s.left_rms + ' / ' + s.right_rms + ' RMS · ' + ({left:'左',right:'右',center:'中'}[s.doa] || '待定'));
+  else show('cloud', (cloudLabels[cloud.phase] || cloud.phase) +
+       (cloud.http ? ' · HTTP ' + cloud.http : (cloud.phase.endsWith('_error') ? ' · 未收到 HTTP 响应' : '')));
+  renderSonar(s);
+  renderMotor(s);
+  show('mic_left', s.left_rms + ' RMS');
+  show('mic_right', s.right_rms + ' RMS');
+  byId('mic_left_meter').value = s.left_rms;
+  byId('mic_right_meter').value = s.right_rms;
+  show('mic_direction', directions[s.doa] || '等待清晰话音');
+  const slider = byId('live_volume');
+  slider.disabled = false;
+  if (!volumePending && !slider.matches(':active')) {
+    slider.value = s.volume;
+    show('volume_display', s.volume + '%');
+  }
+  if (!volumePending && field('volume') !== document.activeElement &&
+      Number(field('volume').value) === lastVolume) field('volume').value = s.volume;
+  lastVolume = s.volume;
   show('wake', (s.wake_ready ? s.wake_word : '唤醒模型未加载') + (s.aec ? ' · AEC' : '') +
     (s.listening ? ' · 收音中' : s.speaking ? ' · 播报中' : ''));
+  show('audio_io', 'I²S 读写错误 ' + s.i2s_rx_errors + ' / ' + s.i2s_tx_errors +
+       ' · 播放缓冲耗尽 ' + s.playback_underruns + ' 次');
+  show('playback_result', ({complete:'完整播完',wake_word:'唤醒词打断',manual:'手动停止',
+    i2s_error:'I²S 读写错误',timeout:'等待音频超时',network_lost:'Wi-Fi 断开',
+    cloud_error:'音频流异常'})[s.playback_result] || '—');
   show('transcript', cloud.transcript || '—');
   show('reply', cloud.reply || '—');
   currentMap = s.nav;
@@ -253,8 +422,10 @@ function render(s) {
     });
     byId('places').replaceChildren(...buttons);
   }
-  document.querySelectorAll('[data-command=arm]').forEach(b => b.disabled = s.armed || !s.valid || s.blocked);
-  document.querySelectorAll('[data-command=listen]').forEach(b => b.disabled = !cloud.ready || s.listening);
+  const voiceBusy = cloudActive.has(cloud.phase) || cloud.debug_busy || s.listening || s.speaking;
+  buttons('[data-command=listen]', !cloud.ready || s.listening);
+  buttons(cloudTests, !cloud.ready || voiceBusy);
+  buttons('[data-command=tone],[data-command=wake_feedback]', voiceBusy);
   document.querySelectorAll('[data-command=explore],[data-command=home],[data-command=goto_name],#route')
     .forEach(b => b.disabled = !s.armed || !s.nav.pose || s.nav.mode !== 'idle');
   byId('mark').disabled = !s.nav.pose || s.nav.mode !== 'idle' || s.moving;
@@ -264,17 +435,29 @@ async function refresh() {
   if (!online || pending || document.hidden) return;
   pending = true;
   try { render(await request('/api/status')); }
-  catch { notice('控制台暂时无法读取状态。', true); }
+  catch {
+    show('debug_link', '连接中断');
+    show('sonar_gate', '设备失联 · 读数暂停');
+    byId('test_direction').dataset.motorAvailable = 'false';
+    buttons('[data-drive],[data-cal],[data-command=arm],[data-command=wheel_test]', true);
+    buttons(cloudTests + ',[data-command=listen],[data-command=tone],[data-command=wake_feedback]', true);
+    byId('live_volume').disabled = true;
+  }
   finally { pending = false; }
 }
 async function unlock() {
   try {
     const cfg = await request('/api/config');
     for (const k of [...numeric,'ssid','voice','profile']) field(k).value = cfg[k];
+    byId('live_volume').value = cfg.volume;
+    lastVolume = cfg.volume;
+    show('volume_display', cfg.volume + '%');
     for (const k of ['history','barge']) field(k).checked = cfg[k];
     field('wake_choice').replaceChildren(...cfg.wake_options.map((phrase,i) => new Option(phrase,i)));
     field('wake_choice').value = cfg.wake_choice;
     cfg.polarity.forEach((p,i) => field('polarity'+i).value = p);
+    byId('test_pwm').max = cfg.speed;
+    byId('test_pwm').value = Math.min(Number(byId('test_pwm').value), cfg.speed);
     field('password').placeholder = cfg.has_password ? '已保存，留空保留' : '';
     field('api_key').placeholder = cfg.has_api_key ? '已保存，留空保留' : 'sk-…';
     try { sessionStorage.setItem('rover-key', key); } catch {}
@@ -290,10 +473,27 @@ byId('login').addEventListener('submit', e => { e.preventDefault(); key = byId('
 setInterval(refresh, 650);
 document.addEventListener('visibilitychange', refresh);
 async function control(data, message = '已发送。') {
+  notice('正在发送…');
   try { await request('/api/control', data); notice(message); }
   catch (error) { notice(error.message, true); }
   refresh();
 }
+byId('live_volume').addEventListener('input', e => show('volume_display', e.target.value + '%'));
+byId('live_volume').addEventListener('change', async e => {
+  const value = Number(e.target.value);
+  volumePending = true;
+  try {
+    await request('/api/control', {cmd:'volume',value});
+    field('volume').value = value;
+    notice('音量已设为 ' + value + '%。');
+  } catch (error) {
+    e.target.value = field('volume').value;
+    show('volume_display', e.target.value + '%');
+    notice(error.message, true);
+  } finally {
+    volumePending = false;
+  }
+});
 byId('panel').addEventListener('click', e => {
   const button = e.target.closest('[data-command]');
   if (!button) return;
@@ -306,7 +506,23 @@ byId('panel').addEventListener('click', e => {
   }
   if (cmd === 'home') { body.cmd = 'goto_name'; body.name = '起点'; }
   if (button.dataset.place) body.name = button.dataset.place;
-  if (button.dataset.wheel) body.wheel = Number(button.dataset.wheel);
+  if (cmd === 'wheel_test') {
+    const pwm = byId('test_pwm'), duration = byId('test_ms');
+    if (!pwm.reportValidity() || !duration.reportValidity()) return;
+    body.cmd = byId('test_direction').value;
+    body.wheel = Number(button.dataset.wheel);
+    body.speed = Number(pwm.value);
+    body.duration_ms = Number(duration.value);
+  }
+  if (cmd === 'debug_chat' || cmd === 'debug_tts' || cmd === 'debug_stream') {
+    const input = byId('debug_text');
+    body.text = input.value.trim();
+    if (!body.text) {
+      notice('请先输入测试文字。', true);
+      input.focus();
+      return;
+    }
+  }
   if (button.dataset.cal) body.action = button.dataset.cal;
   control(body, button.textContent + ' · 请求已接受');
 });
@@ -359,6 +575,7 @@ form.addEventListener('submit', async e => {
   for (const k of numeric) payload[k] = Number(field(k).value);
   if (field('clear_password').checked) payload.password = '';
   else if (field('password').value) payload.password = field('password').value;
+  if (field('ap_password').value) payload.ap_password = field('ap_password').value;
   if (field('clear_key').checked) payload.api_key = '';
   else if (field('api_key').value.trim()) payload.api_key = field('api_key').value.trim();
   try {
@@ -367,6 +584,7 @@ form.addEventListener('submit', async e => {
     byId('panel').hidden = true;
     byId('unlock').hidden = false;
     field('api_key').value = '';
+    field('ap_password').value = '';
     notice('已保存，等待重启。请按串口提示重新打开局域网地址。');
   } catch (error) { notice(error.message, true); }
 });
