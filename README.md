@@ -2,11 +2,11 @@
 
 ESP32-S3 N16R8 是唯一车载控制器，双 INMP441 负责唤醒、语音输入和左右声源定位，MAX98357A 驱动 3070 喇叭。ESP32 通过 HTTPS 直接访问 DeepSeek ASR、Flash 和 TTS。四路电机控制、声学前处理、测距急停、网格建图和寻路都在车上完成。
 
-**当前源码版本 1.0.7。** 出门换 Wi-Fi 时，开机后长按 **BOOT 约 3 秒**，手机就可以连接小车热点重新配网。 [长按 BOOT 开启配网热点](#长按-boot-开启配网热点)
+**当前源码版本 1.0.8。** 小车可记住 **5 个 2.4 GHz Wi-Fi**，按列表优先级自动连接。开机后单独长按 **BOOT 约 3 秒**也可以随时开启配网热点。 [管理多个 Wi-Fi](#管理多个-wi-fi) · [长按 BOOT 开启配网热点](#长按-boot-开启配网热点)
 
 | 功能 | 当前实现 |
 | --- | --- |
-| 配网 | 长按 BOOT 开启热点，支持独立 WPA2 密码，保存后重启。已保存的 Wi-Fi 失联时可自动开热点 |
+| 配网 | 保存最多 5 个 Wi-Fi，网页添加、删除和排序。全部失败后自动开热点，也可长按 BOOT 手动开启 |
 | 本地唤醒 | ESP-SR WakeNet9 / WakeNet10 共 20 个预置词，默认「嗨小象」。网页选词，唤醒后轮换播放四条本地应答 |
 | 双麦和插话 | 双声道采样、左右声源定位、I²S 回声抵消。播报时说当前唤醒词可打断 |
 | 云端语音 | 16 kHz 单声道 WAV → DeepSeek ASR → `deepseek-flash` SSE → DeepSeek TTS WebSocket。边接收边播，云端语音约 0.89 倍速 |
@@ -42,7 +42,7 @@ idf.py -p PORT flash monitor
 
 **从 1.0.0 或 1.0.1 更新到 1.0.2** 时，用新烧录包的四段完整写入，包括扩容后的分区表和新 `srmodels.bin`。应用、模型和 NVS 的起始偏移沿用旧版，模型分区从 3 MiB 扩为 8 MiB。用包内命令分段写入并保留 NVS，已有的唤醒词设置、Wi-Fi、DeepSeek Key、地图和对话记忆均可沿用。
 
-已完整烧录 1.0.2 的分区表和模型的设备，可以在编译后用 `idf.py -p PORT app-flash` 更新到 1.0.7，并保留 NVS 中的设置和记忆。
+已完整烧录 1.0.2 的分区表和模型的设备，可以在编译后用 `idf.py -p PORT app-flash` 更新到 1.0.8，并保留 NVS 中的设置和记忆。旧版保存的单个 Wi-Fi 会自动迁移为列表第一项，原有密码可继续使用。
 
 串口速率为 115200。若开发板有 USB 和 UART 两个接口，首次接线可选带 USB 转串口的 UART 接口读日志，或使用板上 USB Serial/JTAG 口。串口显示 `WakeNet ready: 嗨小象 (...)` 或所选词的名称，代表模型初始化完成。 [ESP32-S3 DevKitC 手册](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html) · [WakeNet 文档](https://docs.espressif.com/projects/esp-sr/en/latest/esp32s3/wake_word_engine/README.html)
 
@@ -50,17 +50,24 @@ idf.py -p PORT flash monitor
 
 1. 先断开电池和电机动力，按 [接线方案](WIRING.md) 验证供电，用 USB 给主控上电。查看串口打印的 `DeepSeekRover-XXXX` 和控制台口令。
 2. 在电脑或手机的 Wi-Fi 设置中加入该热点，再用浏览器打开 `http://192.168.4.1`。首次配置时，热点密码和网页控制台口令均使用串口显示的值。
-3. 填写能联网的 2.4 GHz Wi-Fi 和自己的 DeepSeek API 密钥，点「保存并重启」。电脑或手机接回同一局域网，打开串口显示的 ESP32 IP。平时联网后，小车会自动关闭配网热点。网页上「正在同步时钟」消失后可发起 HTTPS 请求。
+3. 点「添加 Wi-Fi」，填写能联网的 2.4 GHz Wi-Fi，再填写自己的 DeepSeek API 密钥，点「保存并重启」。电脑或手机接回同一局域网，打开串口显示的 ESP32 IP。网页上「正在同步时钟」消失后可发起 HTTPS 请求。
 4. 点「喇叭测试音」确认功放，再点「手动听一句」确认转写和回复。也可以说当前唤醒词，听到小车应答再提问。检测到有效语音后，约 0.42 秒静音结束录音。
 5. 任意时候用网页「急停并锁定」停车，手动重新启用后才可下发电机动作。本地识别到唤醒词也会立即暂停车体，语音「停止」在完成 ASR 后再次下达停车。
+
+## 管理多个 Wi-Fi
+
+1. 在「Wi-Fi、DeepSeek 与参数」点「添加 Wi-Fi」，填写 2.4 GHz 网络名称和密码。开放网络勾选「开放网络（无需密码）」。同名网络已保存的密码可留空沿用。
+2. 用「上移」「下移」调整优先级，第一项优先。「删除」会从待保存的列表移除该项。列表最多保留 5 项，点「保存并重启」生效。
+3. 开机和掉线后，固件都从第一项开始，逐个连接。单项连接或等待 IP 最长约 12 秒，收到失败通知会提前尝试下一项。已经连上的网络持续使用到掉线。
+4. 全部尝试失败后，小车开启 `DeepSeekRover-XXXX` 配网热点，并每隔约 15 秒重试一轮。连接成功约 6 秒后，自动开启的配网热点会关闭。列表为空时开机直接开热点。连接成功后，后台会显示当前 Wi-Fi 名称。
 
 ## 长按 BOOT 开启配网热点
 
 1. **等小车正常开机，单独按住 BOOT 约 3 秒再松手。** 小车会停车、锁定电机并开启 `DeepSeekRover-XXXX` 热点。手动开启的热点持续到下次重启。
 2. 手机加入这个 Wi-Fi，打开 `http://192.168.4.1`。热点使用你保存的「小车配网热点密码」。首次配置时，用串口显示的设备口令连热点。进入网页时，用设备的控制台口令登录。
-3. 填写现场可上网的 2.4 GHz Wi-Fi 或手机热点，点「保存并重启」。已有 DeepSeek API 密钥时可将密钥输入框留空。再把手机接入同一网络，通过小车的新局域网 IP 打开后台。
+3. 添加现场可上网的 2.4 GHz Wi-Fi 或手机热点，按需要调整优先级，然后点「保存并重启」。已有 DeepSeek API 密钥时可将密钥输入框留空。再把手机接入同一网络，通过小车的新局域网 IP 打开后台。
 
-出门前可在后台「Wi-Fi、DeepSeek 与参数」设置独立的热点密码。WPA2 密码需要 **8–63 个可打印 ASCII 字符**。密码保存在 NVS，重启后可继续使用。设置页的密码框留空会保留上次保存的值。小车断开已保存的 Wi-Fi 约 12 秒也会自动开热点，可直接使用同一套配网步骤。
+出门前可在后台「Wi-Fi、DeepSeek 与参数」设置独立的热点密码。WPA2 密码需要 **8–63 个可打印 ASCII 字符**。密码保存在 NVS，重启后可继续使用。配网热点密码框留空会保留上次保存的值。自动开启的配网热点也使用同一套步骤。
 
 单按 **RST** 会重启主控。按住 **BOOT** 再按 **RST** 用于进入串口下载模式。外出配网用正常开机后长按 **BOOT**。
 
@@ -140,12 +147,13 @@ DeepSeek ASR 接收完整 WAV 后返回一次转写。普通对话把 Flash SSE 
 | `main/cloud.c`、`main/audio_wire.c` | DeepSeek HTTPS、SSE、WebSocket、WAV 和流式 PCM |
 | `main/harness.c`、`main/intent.c` | 对话上下文、NVS 记忆和动作意图 |
 | `main/motion.c`、`main/nav.c`、`main/grid.c` | 四轮控制、导航和地图规划 |
-| `main/network.c`、`main/console.html` | 配网、网页状态与操作 |
+| `main/network.c`、`main/wifi_order.c`、`main/console.html` | 配网、Wi-Fi 按序连接、网页状态与操作 |
 | `tests/core.c` | 平台无关的语音格式、动作限制和规划回归检查 |
 
 ```bash
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -I main tests/core.c \
-  main/grid.c main/intent.c main/audio_wire.c main/wake_words.c main/acoustics.c -lm -o /tmp/rover-core-tests
+  main/grid.c main/intent.c main/audio_wire.c main/wake_words.c main/acoustics.c main/wifi_order.c \
+  -lm -o /tmp/rover-core-tests
 /tmp/rover-core-tests
 ```
 

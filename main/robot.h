@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "wifi_order.h"
 
 enum {
     PIN_BOOT = 0,
@@ -22,13 +23,15 @@ typedef enum {
 } playback_result_t;
 
 typedef struct {
-    char ssid[33], password[65], api_key[161], console_key[25], voice[10], profile[301];
+    char legacy_ssid[33], legacy_password[65];  // Keep the layout of NVS v1–v3.
+    char api_key[161], console_key[25], voice[10], profile[301];
     int stop_cm, speed, nav_speed, step_ms, turn_left_ms, turn_right_ms, cell_cm;
     int polarity[4];
     int vad_rms, barge_rms, mic_spacing_mm, volume, ref_delay;
     bool history, barge;
     uint32_t wake_choice;
     char ap_password[64];
+    wifi_profiles_t wifi_profiles;
 } robot_config_t;
 
 typedef struct {

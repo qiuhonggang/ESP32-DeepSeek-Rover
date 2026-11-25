@@ -37,6 +37,14 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 .mic-test meter{width:100%;height:16px;accent-color:var(--mint)}
 .volume-control{margin:10px 0}
 .volume-control input{padding:0;accent-color:var(--mint)}
+.wifi-settings{margin:0 0 12px;padding:10px 12px 12px;min-width:0;border:1px solid var(--line);border-radius:8px}
+.wifi-settings legend{font-weight:700;padding:0 5px}
+.wifi-networks{display:grid;gap:10px;margin:0 0 10px;padding-inline-start:26px}
+.wifi-network{padding:7px 0 10px;border-bottom:1px solid var(--line)}
+.wifi-network::marker{color:var(--mint);font-weight:700}
+.wifi-actions{display:flex;flex-wrap:wrap;gap:6px}
+.wifi-actions button,.wifi-settings>button{width:auto}
+#wifi_error{color:var(--red)}
 .small{font-size:14px}[hidden]{display:none!important}
 </style>
 </head>
@@ -191,9 +199,30 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
   <details id="settings">
     <summary>Wi-Fi、DeepSeek 与参数</summary>
     <form id="config">
+      <fieldset class="wifi-settings">
+        <legend>2.4 GHz Wi-Fi</legend>
+        <p id="wifi_current" class="small" role="status"></p>
+        <p class="small">从上往下尝试，第一项优先。调整后点「保存并重启」。</p>
+        <ol id="wifi_networks" class="wifi-networks"></ol>
+        <p id="wifi_empty" class="small" hidden>列表为空。启动后会直接打开配网热点。</p>
+        <p id="wifi_error" class="small" role="status" hidden></p>
+        <button id="wifi_add" type="button">添加 Wi-Fi</button>
+        <template id="wifi_row">
+          <li class="wifi-network">
+            <div class="fields">
+              <label>名称（SSID）<input data-wifi="ssid" maxlength="32" autocomplete="off"></label>
+              <label>密码<input data-wifi="password" type="password" maxlength="64" autocomplete="new-password"></label>
+            </div>
+            <label class="check"><input data-wifi="open" type="checkbox">开放网络（无需密码）</label>
+            <div class="wifi-actions">
+              <button type="button" data-wifi="up">上移</button>
+              <button type="button" data-wifi="down">下移</button>
+              <button type="button" data-wifi="remove">删除</button>
+            </div>
+          </li>
+        </template>
+      </fieldset>
       <div class="fields">
-        <label>2.4 GHz Wi-Fi 名称<input name="ssid" maxlength="32" autocomplete="off"></label>
-        <label>Wi-Fi 密码<input name="password" type="password" maxlength="64" autocomplete="new-password"></label>
         <label>小车配网热点密码<input name="ap_password" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="留空保留现有密码"></label>
         <label>DeepSeek API 密钥<input name="api_key" type="password" maxlength="160" autocomplete="new-password"></label>
         <label>本地唤醒词<select name="wake_choice"></select></label>
@@ -201,7 +230,6 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       </div>
       <label>对话资料和偏好<textarea name="profile" maxlength="100" rows="2" placeholder="例如 请用简短的中文回答"></textarea></label>
       <div class="row">
-        <label class="check"><input type="checkbox" name="clear_password">清除 Wi-Fi 密码</label>
         <label class="check"><input type="checkbox" name="clear_key">清除 API 密钥</label>
         <label class="check"><input type="checkbox" name="history">保存近期对话</label>
         <label class="check"><input type="checkbox" name="barge">播报时可用当前唤醒词打断</label>
@@ -245,6 +273,10 @@ const form = byId('config');
 const field = name => form.elements.namedItem(name);
 const canvas = byId('map'), pen = canvas.getContext('2d');
 const numeric = ['stop_cm','speed','nav_speed','step_ms','turn_left_ms','turn_right_ms','cell_cm','vad_rms','barge_rms','mic_spacing_mm','volume','ref_delay'];
+const wifiList = byId('wifi_networks'), wifiAdd = byId('wifi_add');
+const wifiSaved = new Map();
+const wifiEncoder = new TextEncoder();
+let wifiLimit = 0;
 let key = '', online = false, pending = false, currentMap = null, selected = {x:10,y:10}, placesCache = '';
 let sonarHistory = [], lastMeasurement = null;
 let lastVolume = null, volumePending = false;
@@ -272,6 +304,85 @@ function notice(message, error = false) {
   byId('notice').classList.toggle('error', error);
 }
 function show(id, value) { byId(id).textContent = value; }
+function wifiField(row, name) { return row.querySelector('[data-wifi="' + name + '"]'); }
+function showWifiError(message, input) {
+  show('wifi_error', message);
+  byId('wifi_error').hidden = !message;
+  if (input) input.focus();
+}
+function syncWifiList() {
+  const rows = [...wifiList.children];
+  rows.forEach((row, i) => {
+    wifiField(row, 'up').disabled = i === 0;
+    wifiField(row, 'down').disabled = i === rows.length - 1;
+    for (const [name, label] of [['up','上移'],['down','下移'],['remove','删除']]) {
+      wifiField(row, name).setAttribute('aria-label', label + '第 ' + (i + 1) + ' 项 Wi-Fi');
+    }
+    const password = wifiField(row, 'password');
+    password.disabled = wifiField(row, 'open').checked;
+    password.placeholder = wifiSaved.get(wifiField(row, 'ssid').value) ? '已保存，留空保留' : '';
+  });
+  wifiAdd.disabled = rows.length >= wifiLimit;
+  byId('wifi_empty').hidden = rows.length !== 0;
+}
+function appendWifi(entry) {
+  const row = byId('wifi_row').content.firstElementChild.cloneNode(true);
+  wifiField(row, 'ssid').value = entry?.ssid || '';
+  wifiField(row, 'open').checked = entry ? !entry.has_password : false;
+  wifiList.append(row);
+  syncWifiList();
+  return wifiField(row, 'ssid');
+}
+wifiAdd.addEventListener('click', () => appendWifi().focus());
+wifiList.addEventListener('input', () => { showWifiError(''); syncWifiList(); });
+wifiList.addEventListener('click', event => {
+  const button = event.target.closest('button[data-wifi]');
+  if (!button) return;
+  const row = button.closest('li');
+  const action = button.dataset.wifi;
+  let focus = button;
+  if (action === 'up' && row.previousElementSibling) {
+    wifiList.insertBefore(row, row.previousElementSibling);
+  } else if (action === 'down' && row.nextElementSibling) {
+    wifiList.insertBefore(row.nextElementSibling, row);
+  } else if (action === 'remove') {
+    const neighbor = row.nextElementSibling || row.previousElementSibling;
+    focus = neighbor ? wifiField(neighbor, 'ssid') : wifiAdd;
+    row.remove();
+  }
+  showWifiError('');
+  syncWifiList();
+  (focus.disabled ? wifiField(row, 'ssid') : focus).focus();
+});
+function wifiPayload() {
+  const seen = new Set();
+  const profiles = [];
+  for (const row of wifiList.children) {
+    const name = wifiField(row, 'ssid');
+    const password = wifiField(row, 'password');
+    const ssid = name.value;
+    const bytes = wifiEncoder.encode(ssid).length;
+    if (bytes < 1 || bytes > 32 || seen.has(ssid)) {
+      showWifiError('每个 Wi-Fi 名称必须唯一且为 1–32 字节。', name);
+      return null;
+    }
+    const entry = {ssid};
+    if (wifiField(row, 'open').checked) {
+      entry.password = '';
+    } else if (password.value || !wifiSaved.get(ssid)) {
+      const length = wifiEncoder.encode(password.value).length;
+      if (length < 8 || length > 64) {
+        showWifiError('请填写 8–64 字节的 Wi-Fi 密码，或勾选开放网络。', password);
+        return null;
+      }
+      entry.password = password.value;
+    }
+    seen.add(ssid);
+    profiles.push(entry);
+  }
+  showWifiError('');
+  return profiles;
+}
 async function request(path, body) {
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(), 5000);
@@ -366,6 +477,8 @@ function draw() {
 }
 function render(s) {
   show('ip', s.wifi ? s.ip : '配置热点');
+  const wifiStatus = s.wifi_ssid ? '当前连接 ' + s.wifi_ssid : '当前未连接外部 Wi-Fi';
+  if (byId('wifi_current').textContent !== wifiStatus) show('wifi_current', wifiStatus);
   show('debug_link', '设备在线');
   const cloud = s.cloud;
   const hardware = cloud.hardware;
@@ -448,7 +561,13 @@ async function refresh() {
 async function unlock() {
   try {
     const cfg = await request('/api/config');
-    for (const k of [...numeric,'ssid','voice','profile']) field(k).value = cfg[k];
+    for (const k of [...numeric,'voice','profile']) field(k).value = cfg[k];
+    wifiLimit = cfg.wifi_limit;
+    wifiSaved.clear();
+    wifiList.replaceChildren();
+    for (const entry of cfg.wifi_networks) wifiSaved.set(entry.ssid, entry.has_password);
+    for (const entry of cfg.wifi_networks) appendWifi(entry);
+    syncWifiList();
     byId('live_volume').value = cfg.volume;
     lastVolume = cfg.volume;
     show('volume_display', cfg.volume + '%');
@@ -458,12 +577,11 @@ async function unlock() {
     cfg.polarity.forEach((p,i) => field('polarity'+i).value = p);
     byId('test_pwm').max = cfg.speed;
     byId('test_pwm').value = Math.min(Number(byId('test_pwm').value), cfg.speed);
-    field('password').placeholder = cfg.has_password ? '已保存，留空保留' : '';
     field('api_key').placeholder = cfg.has_api_key ? '已保存，留空保留' : 'sk-…';
     try { sessionStorage.setItem('rover-key', key); } catch {}
     byId('unlock').hidden = true;
     byId('panel').hidden = false;
-    byId('settings').open = !cfg.has_api_key || !cfg.ssid;
+    byId('settings').open = !cfg.has_api_key || !wifiList.children.length;
     online = true;
     notice('');
     refresh();
@@ -568,13 +686,13 @@ for (const id of ['clear_memory','clear_all']) byId(id).addEventListener('click'
 });
 form.addEventListener('submit', async e => {
   e.preventDefault();
-  const payload = {ssid:field('ssid').value, voice:field('voice').value, wake_choice:Number(field('wake_choice').value),
+  const wifi_networks = wifiPayload();
+  if (!wifi_networks) return;
+  const payload = {wifi_networks, voice:field('voice').value, wake_choice:Number(field('wake_choice').value),
     profile:field('profile').value,
     history:field('history').checked, barge:field('barge').checked,
     polarity:[0,1,2,3].map(i => Number(field('polarity'+i).value))};
   for (const k of numeric) payload[k] = Number(field(k).value);
-  if (field('clear_password').checked) payload.password = '';
-  else if (field('password').value) payload.password = field('password').value;
   if (field('ap_password').value) payload.ap_password = field('ap_password').value;
   if (field('clear_key').checked) payload.api_key = '';
   else if (field('api_key').value.trim()) payload.api_key = field('api_key').value.trim();
@@ -585,7 +703,8 @@ form.addEventListener('submit', async e => {
     byId('unlock').hidden = false;
     field('api_key').value = '';
     field('ap_password').value = '';
-    notice('已保存，等待重启。请按串口提示重新打开局域网地址。');
+    for (const row of wifiList.children) wifiField(row, 'password').value = '';
+    notice('已保存，小车将按列表顺序连接。请通过新局域网地址重新打开后台。');
   } catch (error) { notice(error.message, true); }
 });
 if (key) unlock();

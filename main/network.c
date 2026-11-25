@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "driver/gpio.h"
@@ -20,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -35,6 +37,9 @@ static esp_netif_t *station;
 static char ap_ssid[20];
 static atomic_bool wifi_up, rebooting;
 static SemaphoreHandle_t config_lock;
+static EventGroupHandle_t wifi_events;
+static bool sta_link;
+enum { STA_FAILED = BIT0, STA_GOT_IP = BIT1, STA_STOPPED = BIT2 };
 static const char STORE[] = "rover_cfg";
 extern const char console_start[] asm("_binary_console_html_start");
 
@@ -53,7 +58,7 @@ static esp_err_t save_config(const robot_config_t *config)
     nvs_handle_t nvs;
     esp_err_t result = nvs_open(STORE, NVS_READWRITE, &nvs);
     if (result != ESP_OK) return result;
-    result = nvs_set_blob(nvs, "config-v3", config, sizeof(*config));
+    result = nvs_set_blob(nvs, "config-v4", config, sizeof(*config));
     if (result == ESP_OK) result = nvs_commit(nvs);
     nvs_close(nvs);
     return result;
@@ -63,27 +68,31 @@ void network_load_config(void)
 {
     config_lock = xSemaphoreCreateMutex();
     assert(config_lock);
+    bool migrated = false;
     nvs_handle_t nvs;
     if (nvs_open(STORE, NVS_READONLY, &nvs) == ESP_OK) {
-        robot_config_t saved = robot_config;
-        size_t length = sizeof(saved);
-        if (nvs_get_blob(nvs, "config-v3", &saved, &length) == ESP_OK && length == sizeof(saved)) {
+        const struct { const char *key; size_t bytes; } versions[] = {
+            {"config-v4", sizeof(robot_config_t)},
+            {"config-v3", offsetof(robot_config_t, wifi_profiles)},
+            {"config-v2", offsetof(robot_config_t, ap_password)},
+            {"config-v1", offsetof(robot_config_t, wake_choice)},
+        };
+        for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); ++i) {
+            robot_config_t saved = robot_config;
+            size_t length = versions[i].bytes;
+            if (nvs_get_blob(nvs, versions[i].key, &saved, &length) != ESP_OK ||
+                length != versions[i].bytes || saved.wifi_profiles.count > WIFI_PROFILE_LIMIT) continue;
             robot_config = saved;
-        } else {
-            saved = robot_config;
-            length = offsetof(robot_config_t, ap_password);
-            if (nvs_get_blob(nvs, "config-v2", &saved, &length) == ESP_OK &&
-                length == offsetof(robot_config_t, ap_password)) {
-                robot_config = saved;
-            } else {
-                // The original configuration ended before wake_choice.
-                saved = robot_config;
-                length = offsetof(robot_config_t, wake_choice);
-                if (nvs_get_blob(nvs, "config-v1", &saved, &length) == ESP_OK &&
-                    length == offsetof(robot_config_t, wake_choice)) robot_config = saved;
-            }
+            migrated = i > 0;
+            break;
         }
         nvs_close(nvs);
+    }
+    if (migrated) {
+        wifi_profiles_add(&robot_config.wifi_profiles, NULL, robot_config.legacy_ssid,
+                          robot_config.legacy_password);
+        memset(robot_config.legacy_ssid, 0, sizeof(robot_config.legacy_ssid));
+        memset(robot_config.legacy_password, 0, sizeof(robot_config.legacy_password));
     }
     if (robot_config.wake_choice >= wake_option_count) robot_config.wake_choice = 0;
     if (!robot_config.console_key[0]) {
@@ -94,6 +103,8 @@ void network_load_config(void)
         snprintf(robot_config.console_key, sizeof(robot_config.console_key), "%08lx%08lx%08lx",
                  (unsigned long)entropy[0], (unsigned long)entropy[1], (unsigned long)entropy[2]);
         ESP_ERROR_CHECK(save_config(&robot_config));
+    } else if (migrated && save_config(&robot_config) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not save migrated Wi-Fi configuration");
     }
 }
 
@@ -126,13 +137,46 @@ bool network_ready(void)
     return robot_config.api_key[0] && network_wifi_up() && clock_ready() && !atomic_load(&rebooting);
 }
 
+static bool set_provisioning(bool enabled)
+{
+    return esp_wifi_set_mode(enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA) == ESP_OK;
+}
+
+static bool reset_station(bool provisioning)
+{
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) return false;
+    if (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) {
+        xEventGroupClearBits(wifi_events, STA_STOPPED);
+        if (esp_wifi_set_mode(provisioning ? WIFI_MODE_AP : WIFI_MODE_NULL) != ESP_OK) return false;
+        EventBits_t stopped = xEventGroupWaitBits(wifi_events, STA_STOPPED, pdTRUE, pdFALSE,
+                                                pdMS_TO_TICKS(1500));
+        if (!(stopped & STA_STOPPED)) ESP_LOGW(TAG, "Station stop event timed out");
+    }
+    xEventGroupClearBits(wifi_events, STA_FAILED | STA_GOT_IP);
+    return set_provisioning(provisioning);
+}
+
+static void connect_profile(const wifi_profile_t *profile, uint32_t priority)
+{
+    wifi_config_t config = {0};
+    memcpy(config.sta.ssid, profile->ssid, strlen(profile->ssid));
+    memcpy(config.sta.password, profile->password, strlen(profile->password));
+    ESP_LOGI(TAG, "Trying Wi-Fi priority %lu", (unsigned long)priority);
+    if (esp_wifi_set_config(WIFI_IF_STA, &config) != ESP_OK || esp_wifi_connect() != ESP_OK) {
+        xEventGroupSetBits(wifi_events, STA_FAILED);
+    }
+}
+
 static void connection_task(void *unused)
 {
     (void)unused;
-    bool ap = true;
+    const wifi_profiles_t *profiles = &robot_config.wifi_profiles;
+    bool ap = profiles->count == 0;
     bool forced_setup = false;
-    unsigned connected_seconds = 0, disconnected_seconds = 0;
-    int64_t pressed_at = 0, check_at = 0;
+    bool station_reset_needed = false;
+    wifi_order_t order = {.fallback_ap = ap};
+    int64_t pressed_at = 0;
     while (true) {
         int64_t now = esp_timer_get_time();
         if (gpio_get_level(PIN_BOOT)) {
@@ -144,24 +188,28 @@ static void connection_task(void *unused)
             nav_stop(true);
             audio_interrupt();
             ESP_LOGI(TAG, "BOOT requested provisioning at http://192.168.4.1");
-            check_at = now;
         }
-        if (now < check_at) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-        check_at = now + 1000000;
-        if (forced_setup && !ap && esp_wifi_set_mode(WIFI_MODE_APSTA) == ESP_OK) ap = true;
-        if (network_wifi_up()) {
-            disconnected_seconds = 0;
-            if (++connected_seconds >= 6 && !forced_setup && ap &&
-                esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) ap = false;
-            if (connected_seconds > 6) connected_seconds = 6;
-        } else {
-            connected_seconds = 0;
-            if (++disconnected_seconds >= 12 && !ap && esp_wifi_set_mode(WIFI_MODE_APSTA) == ESP_OK) ap = true;
-            if (disconnected_seconds > 12) disconnected_seconds = 12;
-            if (robot_config.ssid[0] && disconnected_seconds % 3 == 0) esp_wifi_connect();
+        if (!atomic_load(&rebooting)) {
+            bool enable_ap = forced_setup || order.fallback_ap;
+            if (station_reset_needed) {
+                if (reset_station(enable_ap)) {
+                    station_reset_needed = false;
+                    ap = enable_ap;
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            EventBits_t events = xEventGroupWaitBits(wifi_events, STA_FAILED | STA_GOT_IP,
+                                                     pdTRUE, pdFALSE, 0);
+            wifi_order_action_t action = wifi_order_step(&order, profiles->count, now / 1000,
+                network_wifi_up(), events & STA_GOT_IP, events & STA_FAILED);
+            if (action == WIFI_ORDER_CONNECT) {
+                connect_profile(&profiles->entries[order.next - 1], order.next);
+            } else if (action == WIFI_ORDER_RESET_STA) {
+                station_reset_needed = !reset_station(ap);
+            }
+            enable_ap = forced_setup || order.fallback_ap;
+            if (!station_reset_needed && ap != enable_ap && set_provisioning(enable_ap)) ap = enable_ap;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -170,16 +218,19 @@ static void connection_task(void *unused)
 static void wifi_event(void *arg, esp_event_base_t base, int32_t event, void *data)
 {
     (void)arg;
-    if (base == WIFI_EVENT && event == WIFI_EVENT_STA_START && robot_config.ssid[0]) esp_wifi_connect();
     if (base == WIFI_EVENT && event == WIFI_EVENT_AP_START) ESP_LOGI(TAG, "Provisioning AP active: %s", ap_ssid);
-    if (base == WIFI_EVENT && event == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && event == WIFI_EVENT_STA_CONNECTED) sta_link = true;
+    if (base == WIFI_EVENT && (event == WIFI_EVENT_STA_DISCONNECTED || event == WIFI_EVENT_STA_STOP)) {
+        sta_link = false;
         if (atomic_exchange(&wifi_up, false)) {
             nav_stop(true);
             audio_network_lost();
         }
+        xEventGroupSetBits(wifi_events, event == WIFI_EVENT_STA_STOP ? STA_STOPPED : STA_FAILED);
     }
-    if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP) {
+    if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP && sta_link) {
         atomic_store(&wifi_up, true);
+        xEventGroupSetBits(wifi_events, STA_GOT_IP);
         const ip_event_got_ip_t *ip = data;
         ESP_LOGI(TAG, "Rover console at http://" IPSTR, IP2STR(&ip->ip_info.ip));
         if (!esp_sntp_enabled()) {
@@ -221,16 +272,21 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *json)
 
 static cJSON *read_json(httpd_req_t *req)
 {
-    char body[1600];
-    if (req->content_len < 2 || req->content_len >= sizeof(body)) return NULL;
+    if (req->content_len < 2 || req->content_len > 6144) return NULL;
+    char *body = malloc(req->content_len + 1);
+    if (!body) return NULL;
     size_t pos = 0;
     while (pos < req->content_len) {
         int bytes = httpd_req_recv(req, body + pos, req->content_len - pos);
-        if (bytes <= 0) return NULL;
+        if (bytes <= 0) {
+            free(body);
+            return NULL;
+        }
         pos += bytes;
     }
     body[pos] = 0;
     cJSON *json = cJSON_ParseWithOpts(body, NULL, true);
+    free(body);
     if (cJSON_IsObject(json)) return json;
     cJSON_Delete(json);
     return NULL;
@@ -271,6 +327,12 @@ static esp_err_t get_status(httpd_req_t *req)
         char address[20];
         snprintf(address, sizeof(address), IPSTR, IP2STR(&ip.ip));
         cJSON_AddStringToObject(json, "ip", address);
+        wifi_ap_record_t access_point;
+        char ssid[WIFI_SSID_BYTES + 1] = {0};
+        if (network_wifi_up() && esp_wifi_sta_get_ap_info(&access_point) == ESP_OK) {
+            memcpy(ssid, access_point.ssid, WIFI_SSID_BYTES);
+        }
+        cJSON_AddStringToObject(json, "wifi_ssid", ssid);
         cJSON_AddBoolToObject(json, "wifi", network_wifi_up());
         cJSON_AddBoolToObject(json, "clock", clock_ready());
         cJSON_AddBoolToObject(json, "key_set", robot_config.api_key[0]);
@@ -323,7 +385,18 @@ static esp_err_t get_config(httpd_req_t *req)
     if (!authorize(req)) return ESP_OK;
     cJSON *json = cJSON_CreateObject();
     if (json) {
-        cJSON_AddStringToObject(json, "ssid", robot_config.ssid);
+        const wifi_profiles_t *profiles = &robot_config.wifi_profiles;
+        cJSON_AddStringToObject(json, "ssid", profiles->count ? profiles->entries[0].ssid : "");
+        cJSON_AddBoolToObject(json, "has_password", profiles->count && profiles->entries[0].password[0]);
+        cJSON_AddNumberToObject(json, "wifi_limit", WIFI_PROFILE_LIMIT);
+        cJSON *networks = cJSON_AddArrayToObject(json, "wifi_networks");
+        for (uint32_t i = 0; i < profiles->count; ++i) {
+            cJSON *item = cJSON_CreateObject();
+            if (!item) break;
+            cJSON_AddStringToObject(item, "ssid", profiles->entries[i].ssid);
+            cJSON_AddBoolToObject(item, "has_password", profiles->entries[i].password[0]);
+            if (!cJSON_AddItemToArray(networks, item)) cJSON_Delete(item);
+        }
         cJSON_AddStringToObject(json, "voice", robot_config.voice);
         cJSON_AddNumberToObject(json, "wake_choice", robot_config.wake_choice);
         cJSON *words = cJSON_AddArrayToObject(json, "wake_options");
@@ -334,7 +407,6 @@ static esp_err_t get_config(httpd_req_t *req)
         cJSON_AddBoolToObject(json, "history", robot_config.history);
         cJSON_AddBoolToObject(json, "barge", robot_config.barge);
         cJSON_AddBoolToObject(json, "has_api_key", robot_config.api_key[0]);
-        cJSON_AddBoolToObject(json, "has_password", robot_config.password[0]);
         cJSON_AddBoolToObject(json, "has_ap_password", robot_config.ap_password[0]);
         xSemaphoreTake(config_lock, portMAX_DELAY);
         for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
@@ -346,7 +418,7 @@ static esp_err_t get_config(httpd_req_t *req)
     return send_json(req, json);
 }
 
-static bool read_field(cJSON *json, const char *name, char *target, size_t length)
+static bool read_field(const cJSON *json, const char *name, char *target, size_t length)
 {
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(json, name);
     if (!item) return true;
@@ -364,16 +436,44 @@ static bool token_valid(const char *token)
     return true;
 }
 
+static bool apply_wifi_profiles(const cJSON *json, wifi_profiles_t *profiles)
+{
+    const cJSON *networks = cJSON_GetObjectItemCaseSensitive(json, "wifi_networks");
+    wifi_profiles_t updated = {0};
+    if (networks) {
+        if (!cJSON_IsArray(networks) || cJSON_GetArraySize(networks) > WIFI_PROFILE_LIMIT ||
+            cJSON_HasObjectItem(json, "ssid") || cJSON_HasObjectItem(json, "password")) return false;
+        const cJSON *entry;
+        cJSON_ArrayForEach(entry, networks) {
+            const cJSON *secret = cJSON_GetObjectItemCaseSensitive(entry, "password");
+            if (secret && !cJSON_IsString(secret)) return false;
+            if (!wifi_profiles_add(&updated, profiles, get_text(entry, "ssid"),
+                                   cJSON_GetStringValue(secret))) return false;
+        }
+    } else {
+        // Older console clients can still update the first profile.
+        if (!cJSON_HasObjectItem(json, "ssid") && !cJSON_HasObjectItem(json, "password")) return true;
+        wifi_profile_t first = profiles->entries[0];
+        if (!read_field(json, "ssid", first.ssid, sizeof(first.ssid)) ||
+            !read_field(json, "password", first.password, sizeof(first.password))) return false;
+        if (first.ssid[0] && !wifi_profiles_add(&updated, NULL, first.ssid, first.password)) return false;
+        for (uint32_t i = 1; i < profiles->count; ++i) {
+            const wifi_profile_t *profile = &profiles->entries[i];
+            if (!wifi_profiles_add(&updated, NULL, profile->ssid, profile->password)) return false;
+        }
+    }
+    *profiles = updated;
+    return true;
+}
+
 static bool apply_config(cJSON *json, robot_config_t *next)
 {
     if (!json ||
-        !read_field(json, "ssid", next->ssid, sizeof(next->ssid)) ||
-        !read_field(json, "password", next->password, sizeof(next->password)) ||
+        !apply_wifi_profiles(json, &next->wifi_profiles) ||
         !read_field(json, "api_key", next->api_key, sizeof(next->api_key)) ||
         !read_field(json, "profile", next->profile, sizeof(next->profile)) ||
         !read_field(json, "ap_password", next->ap_password, sizeof(next->ap_password)) ||
         !read_field(json, "voice", next->voice, sizeof(next->voice))) return false;
-    if (next->password[0] && strlen(next->password) < 8) return false;
     if (next->ap_password[0] && strlen(next->ap_password) < 8) return false;
     for (const unsigned char *c = (const unsigned char *)next->ap_password; *c; ++c) {
         if (*c < 32 || *c > 126) return false;
@@ -406,6 +506,7 @@ static bool apply_config(cJSON *json, robot_config_t *next)
 static void restart_task(void *unused)
 {
     (void)unused;
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     vTaskDelay(pdMS_TO_TICKS(850));
     esp_restart();
 }
@@ -430,12 +531,15 @@ static esp_err_t post_config(httpd_req_t *req)
     atomic_store(&rebooting, true);
     nav_stop(true);
     audio_interrupt();
-    if (save_config(&next) != ESP_OK ||
-        xTaskCreate(restart_task, "restart", 2048, NULL, 3, NULL) != pdPASS) {
+    TaskHandle_t restart = NULL;
+    if (xTaskCreate(restart_task, "restart", 2048, NULL, 3, &restart) != pdPASS ||
+        save_config(&next) != ESP_OK) {
+        if (restart) vTaskDelete(restart);
         atomic_store(&rebooting, false);
         xSemaphoreGive(config_lock);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save or restart");
     }
+    xTaskNotifyGive(restart);
     xSemaphoreGive(config_lock);
     return httpd_resp_sendstr(req, "saved");
 }
@@ -516,6 +620,8 @@ void network_start(void)
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    wifi_events = xEventGroupCreate();
+    assert(wifi_events);
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
 
@@ -526,15 +632,14 @@ void network_start(void)
     strlcpy((char *)ap.ap.ssid, ap_ssid, sizeof(ap.ap.ssid));
     const char *ap_password = robot_config.ap_password[0] ? robot_config.ap_password : robot_config.console_key;
     strlcpy((char *)ap.ap.password, ap_password, sizeof(ap.ap.password));
-    wifi_config_t wifi = {0};
-    memcpy(wifi.sta.ssid, robot_config.ssid, strlen(robot_config.ssid));
-    memcpy(wifi.sta.password, robot_config.password, strlen(robot_config.password));
+    // Configure the AP while its interface is enabled, before any beacons are sent.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
-    if (robot_config.ssid[0]) ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
+    if (robot_config.wifi_profiles.count) ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_LOGI(TAG, "Setup AP %s / http://192.168.4.1 / console key: %s", ap_ssid, robot_config.console_key);
+    ESP_LOGI(TAG, "Setup AP %s (hold BOOT) / http://192.168.4.1 / console key: %s",
+             ap_ssid, robot_config.console_key);
 
     httpd_handle_t server;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();

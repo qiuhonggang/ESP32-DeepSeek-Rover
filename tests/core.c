@@ -145,11 +145,58 @@ static void test_audio(void)
     puts("PASS slower playback sample count, odd WebSocket boundaries and final samples");
 }
 
+static void test_wifi_profiles(void)
+{
+    wifi_profiles_t saved = {0}, edited = {0};
+    assert(wifi_profiles_add(&saved, NULL, "Home", "test-home"));
+    assert(wifi_profiles_add(&saved, NULL, "Phone", "test-phone"));
+    assert(wifi_profiles_add(&edited, &saved, "Phone", NULL));
+    assert(wifi_profiles_add(&edited, &saved, "Home", NULL));
+    assert(strcmp(edited.entries[0].password, "test-phone") == 0);
+    assert(strcmp(edited.entries[1].password, "test-home") == 0);
+    assert(!wifi_profiles_add(&edited, &saved, "Other", NULL));
+    assert(!wifi_profiles_add(&edited, NULL, "Phone", "another-pass"));
+    assert(!wifi_profiles_add(&edited, NULL, "Other", "short"));
+    assert(!wifi_profiles_add(&edited, NULL, "123456789012345678901234567890123", ""));
+    assert(wifi_profiles_add(&edited, &saved, "Open", ""));
+    assert(wifi_profiles_add(&edited, NULL, "12345678901234567890123456789012", ""));
+    assert(wifi_profiles_add(&edited, NULL, "Fifth", "test-fifth"));
+    assert(!wifi_profiles_add(&edited, NULL, "Sixth", "test-sixth"));
+    puts("PASS Wi-Fi priority edits, credential retention, validation and capacity");
+}
+
+static void test_wifi_rotation(void)
+{
+    wifi_order_t order = {0};
+    assert(wifi_order_step(&order, 0, 0, false, false, false) == WIFI_ORDER_WAIT && order.fallback_ap);
+
+    order = (wifi_order_t){0};
+    assert(wifi_order_step(&order, 3, 0, false, false, false) == WIFI_ORDER_CONNECT && order.next == 1);
+    assert(wifi_order_step(&order, 3, 200, false, false, true) == WIFI_ORDER_CONNECT && order.next == 2);
+    assert(wifi_order_step(&order, 3, 800, true, true, false) == WIFI_ORDER_WAIT && !order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 900, false, false, true) == WIFI_ORDER_CONNECT && order.next == 1);
+    assert(wifi_order_step(&order, 3, 12899, false, false, false) == WIFI_ORDER_WAIT);
+    assert(wifi_order_step(&order, 3, 12900, false, false, false) == WIFI_ORDER_RESET_STA);
+    assert(wifi_order_step(&order, 3, 12950, false, false, false) == WIFI_ORDER_CONNECT && order.next == 2);
+    assert(wifi_order_step(&order, 3, 13500, false, false, true) == WIFI_ORDER_CONNECT && order.next == 3);
+    assert(!order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 14000, false, false, true) == WIFI_ORDER_WAIT && order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 28999, false, false, false) == WIFI_ORDER_WAIT);
+    assert(wifi_order_step(&order, 3, 29000, false, false, false) == WIFI_ORDER_CONNECT && order.next == 1);
+    assert(wifi_order_step(&order, 3, 29600, true, true, false) == WIFI_ORDER_WAIT && order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 35599, true, false, false) == WIFI_ORDER_WAIT && order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 35600, true, false, false) == WIFI_ORDER_WAIT && !order.fallback_ap);
+    assert(wifi_order_step(&order, 3, 37200, false, true, true) == WIFI_ORDER_CONNECT && order.next == 1);
+    puts("PASS ordered Wi-Fi startup, disconnect, timeout, fallback AP and recovery");
+}
+
 int main(void)
 {
     test_grid();
     test_intent();
     test_speech_direction();
+    test_wifi_profiles();
+    test_wifi_rotation();
     test_audio();
     return 0;
 }
