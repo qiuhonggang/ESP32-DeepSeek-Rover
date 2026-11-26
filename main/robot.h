@@ -19,7 +19,7 @@ typedef enum { DIR_UNKNOWN, DIR_LEFT, DIR_CENTER, DIR_RIGHT } direction_t;
 typedef enum { MOTION_IDLE, MOTION_RUNNING, MOTION_DONE, MOTION_ABORTED } motion_result_t;
 typedef enum {
     PLAYBACK_NONE, PLAYBACK_COMPLETE, PLAYBACK_WAKE_WORD, PLAYBACK_MANUAL,
-    PLAYBACK_I2S_ERROR, PLAYBACK_TIMEOUT, PLAYBACK_NETWORK_LOST, PLAYBACK_CLOUD_ERROR,
+    PLAYBACK_I2S_ERROR, PLAYBACK_TIMEOUT, PLAYBACK_NETWORK_LOST, PLAYBACK_CLOUD_ERROR, PLAYBACK_VOICE,
 } playback_result_t;
 
 typedef struct {
@@ -46,15 +46,17 @@ typedef struct {
 typedef struct {
     int left_rms, right_rms, speech_rms;
     uint32_t i2s_rx_errors, i2s_tx_errors, playback_underruns, wake_cue;
+    int followup_ms;
     direction_t direction;
     playback_result_t playback_result;
     bool listening, speaking, aec, wake_ready;
 } audio_status_t;
 
-typedef enum { UP_WAKE, UP_AUDIO, UP_END, UP_ABORT, UP_INTERRUPT, UP_PLAY_DONE, UP_PLAY_ABORT } uplink_type_t;
+typedef enum { UP_WAKE, UP_AUDIO, UP_END, UP_ABORT, UP_INTERRUPT, UP_PLAY_BEGIN, UP_PLAY_DONE, UP_PLAY_ABORT } uplink_type_t;
 typedef struct {
     uplink_type_t type;
     uint32_t id;
+    uint32_t at_ms;
     uint16_t bytes;
     direction_t direction;
     bool asr_only;
@@ -90,6 +92,8 @@ void audio_interrupt(void);
 void audio_network_lost(void);
 void audio_cancel_turn(uint32_t id);
 bool audio_turn_is_current(uint32_t id);
+void audio_offer_followup(uint32_t id);
+void audio_end_dialog(uint32_t id);
 bool audio_test_tone(void);
 bool audio_wake_feedback(void);
 bool audio_listen_once(bool asr_only);

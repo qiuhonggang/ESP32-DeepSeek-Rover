@@ -12,7 +12,7 @@
 #include <string.h>
 
 #define MAX_TURNS 12
-#define SEND_TURNS 6
+#define SEND_TURNS 3
 #define MEMORY_VERSION 1
 
 static struct {
@@ -23,43 +23,20 @@ static struct {
 static SemaphoreHandle_t lock;
 
 static const char *PROMPT =
-    "你是一辆会说话的小车，正在跟一位四岁小朋友聊天。"
-    "像耐心、友善的大人一样，用孩子平时能听懂的普通话和她说话。"
-    "先直接回应她说的话。平时只说一两句短句，一次讲一件事；故事也先讲短短一小段。"
-    "顺着孩子这句接话，像真的在和她聊天。换着说，别每次用同样的开头或语尾，也不用句句加语气词。"
-    "用小动物、玩具、颜色等熟悉的东西解释，语气温柔自然，遇到听不清的地方请她慢慢说。"
-    "如果需要追问，一次只问一个简单的问题。害怕或难过时先接住她的感受。"
-    "不要说教、吓唬、故意装幼稚，也别把每条回答都变成夸奖。"
-    "你的话会直接念出来，使用普通标点，不要 Markdown、列表、表情或技术术语。"
-    "不要索要住址、联系方式等个人资料；遇到需要照顾者帮忙的情况，可以说找身边的大人。"
-    "历史对话和偏好可以帮助理解话题，年龄和说话方式仍按本条规则。";
+    "你是会说话的小车，和四岁孩子用普通话聊天。先直答，用一两句自然短句，故事讲一小段。"
+    "语气温柔，不说教、不索要个人信息，遇危险请找身边大人。只说要念出来的话，不用列表或表情。"
+    "车况以本轮实测为准，缺数据就说不知道，不承诺动作已执行。";
 
 static const char *HARDWARE_PROMPT =
-    "本轮硬件 JSON 来自小车实测，硬件问题以这次的数据为准。"
-    "speech_direction 是这句声音相对小车的方位：left 在我左边，right 在我右边，"
-    "center 在我中间这条线附近但分不出前后，unknown 是这次没听清方向。"
-    "如果只问在哪边，就用一句自然的话说方位，不顺带解释测距或其他硬件。"
-    "front_cm 是车头正前方探到的反射物距离，单位厘米，null 是没量到。"
-    "单个测距头分不清是孩子还是别的东西，也量不到侧面和后面。"
-    "如果问离我多远，读数有效就说是车头前面大约多少厘米。"
-    "如果问距离且声音在侧边，就说暂时量不到她在侧边的距离。只有孩子明确说站在车头正前方，"
-    "才可以把读数当成可能是她的距离，仍要说大约、可能。"
-    "读数为空就直接说没量到，按需要请她站到车头正前方。"
-    "不报假读数、不猜角度，不把未知或旧对话中的方向当成现在的位置。"
-    "可以像朋友一样说出看到或听到的结果，一句话说得清就不用念完所有状态。"
-    "motors_armed 表示电机已由成人启用，moving 表示当前在移动，"
-    "front_blocked 为真时前进保护生效。volume_percent 是当前音量，"
-    "voice_pace 是下一次普通语音点动的速度档。网页可启用电机，不能承诺通过聊天解锁。";
+    "speech_direction 是本轮话音相对小车的左右方位；center 分不清前后，unknown 表示没听清。"
+    "只问方向就只答方向。front_cm 是车头前方反射物的厘米数；null 是没量到。"
+    "声源在侧边时测不到人；仅在对方明确位于车头正前方时可说可能是人的大约距离。"
+    "motors_armed 为电机启用，front_blocked 为前进保护，voice_pace 为语音速度档。";
 
 static const char *ACTION_PROMPT =
-    "始终返回 json，格式示例 {\"reply\":\"好的\",\"action\":\"none\"}。"
-    "action 只可用 none、stop、move_forward、move_backward、turn_left、turn_right、"
-    "happy_wiggle、explore、navigate、mark、remember、face_sound。"
-    "仅当当前句明确要求单个动作时使用动作值，历史和偏好只做对话参考。"
-    "action 表示用户明确请求的动作。当前硬件限制动作时，也要填写所请求的动作值。"
-    "动作是否执行由小车控制器检查，别提前宣称已经抵达或完成。"
-    "使用简单、诚实的说法，例如『好呀，我试试看。』或『我还没找到路，我们请大人帮忙吧。』"
-    "上下文中报告的地图位置是估计值。";
+    "只判定本轮是否明确要求一个动作。否定、引用、问句或多动作选 none。"
+    "只返回 JSON {\"action\":\"none\"}，值限 none、move_forward、move_backward、turn_left、turn_right、"
+    "happy_wiggle、explore、navigate、mark、remember、face_sound。执行由小车校验。";
 
 static bool save(void)
 {
@@ -96,35 +73,48 @@ static void message(cJSON *array, const char *role, const char *content)
     cJSON_AddItemToArray(array, object);
 }
 
-static void add_context(cJSON *messages, bool streamed)
+static bool mentions(const char *text, const char *const words[])
 {
-    char map[350], context[900];
-    nav_prompt_context(map, sizeof(map));
+    for (; *words; ++words) if (strstr(text, *words)) return true;
+    return false;
+}
+
+static bool hardware_question(const char *text)
+{
+    const char *const words[] = {"哪边", "哪一边", "哪侧", "方向", "我在哪", "听见我", "左边", "右边", "前面", "后面",
+        "前方", "后方", "离你", "离我", "多远", "多近", "距离", "厘米", "障碍", "电机", "轮子",
+        "音量", "声音多大", "速度", "档位", "能动", "走得", NULL};
+    return mentions(text, words);
+}
+
+static bool add_context(cJSON *messages, const char *text)
+{
+    const char *const place_words[] = {"地图", "地点", "导航", "起点", "哪里", "在哪", "位置", "标记", NULL};
+    const char *const followup_words[] = {"那", "现在", "呢", "这次", "刚才", "还", "再", NULL};
+    bool with_hardware = hardware_question(text);
+    bool refers_back = strlen(text) <= 48 && mentions(text, followup_words);
+    if (mentions(text, place_words)) {
+        char map[350];
+        nav_prompt_context(map, sizeof(map));
+        message(messages, "system", map);
+    }
     xSemaphoreTake(lock, portMAX_DELAY);
-    snprintf(context, sizeof(context), "设备状态：%s。最近明确保存的用户偏好：%s。网页资料：%s。",
-             map, memory.note, robot_config.profile);
-    message(messages, "system", context);
+    if (memory.note[0]) message(messages, "system", memory.note);
+    if (robot_config.profile[0]) message(messages, "system", robot_config.profile);
     if (robot_config.history) {
         uint32_t offset = memory.count > SEND_TURNS ? memory.count - SEND_TURNS : 0;
         for (uint32_t i = offset; i < memory.count; ++i) {
             uint32_t index = (memory.first + i) % MAX_TURNS;
-            message(messages, "user", memory.rows[index].user);
-            if (streamed) {
-                message(messages, "assistant", memory.rows[index].reply);
-                continue;
-            }
-            cJSON *reply = cJSON_CreateObject();
-            if (reply) {
-                cJSON_AddStringToObject(reply, "reply", memory.rows[index].reply);
-                cJSON_AddStringToObject(reply, "action", "none");
-                char *rendered = cJSON_PrintUnformatted(reply);
-                if (rendered) message(messages, "assistant", rendered);
-                cJSON_free(rendered);
-                cJSON_Delete(reply);
-            }
+            char question[121], answer[181];
+            text_copy(question, sizeof(question), memory.rows[index].user);
+            text_copy(answer, sizeof(answer), memory.rows[index].reply);
+            message(messages, "user", question);
+            message(messages, "assistant", answer);
+            if (refers_back) with_hardware |= hardware_question(question);
         }
     }
     xSemaphoreGive(lock);
+    return with_hardware;
 }
 
 const char *voice_pace_name(voice_pace_t pace)
@@ -163,31 +153,35 @@ char *harness_request(const char *text, const char *intent, bool include_context
     cJSON *body = cJSON_CreateObject();
     if (!body) return NULL;
     cJSON_AddStringToObject(body, "model", "deepseek-flash");
-    cJSON_AddNumberToObject(body, "max_tokens", 230);
+    const char *const long_request[] = {"故事", "后来", "接着讲", "详细", "继续讲", NULL};
+    bool action_only = strcmp(intent, "none") != 0;
+    cJSON_AddNumberToObject(body, "max_tokens", action_only ? 32 : mentions(text, long_request) ? 200 : 112);
     cJSON_AddBoolToObject(body, "stream", streamed);
     cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "thinking"), "type", "disabled");
-    cJSON *messages = cJSON_AddArrayToObject(body, "messages");
-    message(messages, "system", PROMPT);
     if (streamed) {
-        message(messages, "system", "只返回要说出口的普通话纯文本。动作由小车本地判定，不要声称已经执行。");
+        cJSON_AddTrueToObject(cJSON_AddObjectToObject(body, "stream_options"), "include_usage");
     } else {
         cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "response_format"), "type", "json_object");
+    }
+    cJSON *messages = cJSON_AddArrayToObject(body, "messages");
+    if (action_only) {
         message(messages, "system", ACTION_PROMPT);
-    }
-    if (include_context) add_context(messages, streamed);
-    if (hardware) {
-        cJSON *snapshot = harness_hardware_json(hardware);
-        char *reading = snapshot ? cJSON_PrintUnformatted(snapshot) : NULL;
-        if (reading) {
-            message(messages, "system", HARDWARE_PROMPT);
-            message(messages, "system", reading);
+    } else {
+        message(messages, "system", PROMPT);
+        if (!streamed) message(messages, "system", "用 JSON 返回 {\"reply\":\"要念的话\"}。");
+        bool with_hardware = include_context ? add_context(messages, text) : hardware_question(text);
+        if (with_hardware && hardware) {
+            cJSON *snapshot = harness_hardware_json(hardware);
+            char *reading = snapshot ? cJSON_PrintUnformatted(snapshot) : NULL;
+            if (reading) {
+                message(messages, "system", HARDWARE_PROMPT);
+                message(messages, "system", reading);
+            }
+            cJSON_free(reading);
+            cJSON_Delete(snapshot);
         }
-        cJSON_free(reading);
-        cJSON_Delete(snapshot);
     }
-    char annotated[540];
-    snprintf(annotated, sizeof(annotated), "本轮用户原话：%s\n本地识别出的意图：%s", text, intent);
-    message(messages, "user", annotated);
+    message(messages, "user", text);
     char *rendered = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     return rendered;

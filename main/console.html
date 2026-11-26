@@ -76,7 +76,8 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
         <dt>转写或输入</dt><dd id="transcript">—</dd>
         <dt>本轮硬件读数</dt><dd id="turn_hardware">—</dd>
         <dt>回复或播报文本</dt><dd id="reply">—</dd>
-        <dt>流式对话耗时</dt><dd id="stream_timings">—</dd>
+        <dt>本轮耗时</dt><dd id="stream_timings">—</dd>
+        <dt>Flash Token</dt><dd id="token_usage">—</dd>
       </dl>
       <div class="row">
         <button data-command="listen">手动听一句</button>
@@ -232,7 +233,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       <div class="row">
         <label class="check"><input type="checkbox" name="clear_key">清除 API 密钥</label>
         <label class="check"><input type="checkbox" name="history">保存近期对话</label>
-        <label class="check"><input type="checkbox" name="barge">播报时可用当前唤醒词打断</label>
+        <label class="check"><input type="checkbox" name="barge">播报时可直接开口打断</label>
       </div>
       <details>
         <summary>测距、电机和声音</summary>
@@ -246,7 +247,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
           <label>格边长（cm）<input name="cell_cm" type="number" min="20" max="45" required></label>
           <label>麦克风间距（mm）<input name="mic_spacing_mm" type="number" min="40" max="220" required></label>
           <label>收音门限（RMS）<input name="vad_rms" type="number" min="50" max="3500" required></label>
-          <label>播报中唤醒门限（RMS）<input name="barge_rms" type="number" min="80" max="4500" required></label>
+          <label>播报中插话门限（RMS）<input name="barge_rms" type="number" min="80" max="4500" required></label>
           <label>播报音量（%）<input name="volume" type="number" min="0" max="75" required></label>
           <label>回声参考延迟帧<input name="ref_delay" type="number" min="0" max="3" required></label>
         </div>
@@ -486,10 +487,19 @@ function render(s) {
     [directions[hardware.speech_direction] || '方位不确定',
       hardware.front_cm == null ? '前方无读数' : '车头前方 ' + hardware.front_cm + ' cm',
       '语音速度档 ' + paces[cloud.voice_pace]].join(' · ') : '—');
-  show('stream_timings', cloud.flash_first_ms || cloud.flash_complete_ms || cloud.tts_first_ms ?
-    [cloud.flash_first_ms && '首段文字 ' + cloud.flash_first_ms + ' ms',
-      cloud.flash_complete_ms && '文字完成 ' + cloud.flash_complete_ms + ' ms',
-      cloud.tts_first_ms && '首批音频 ' + cloud.tts_first_ms + ' ms'].filter(Boolean).join(' · ') : '—');
+  const stages = [
+    cloud.first_play_ms && (cloud.asr_ms ? '说完→I²S ' : '开始→I²S ') + cloud.first_play_ms + ' ms',
+    cloud.asr_ms && 'ASR ' + cloud.asr_ms + ' ms',
+    cloud.flash_first_ms && 'Flash 首段 ' + cloud.flash_first_ms + ' ms',
+    cloud.flash_complete_ms && 'Flash 完成 ' + cloud.flash_complete_ms + ' ms',
+    cloud.tts_ws_ms && 'TTS 建连 ' + cloud.tts_ws_ms + ' ms',
+    cloud.tts_first_ms && 'TTS 首帧 ' + cloud.tts_first_ms + ' ms',
+    cloud.http_reused && '复用 HTTPS',
+  ].filter(Boolean);
+  show('stream_timings', stages.join(' · ') || '—');
+  show('token_usage', cloud.prompt_tokens >= 0 && cloud.completion_tokens >= 0 ?
+    '输入 ' + cloud.prompt_tokens + ' · 输出 ' + cloud.completion_tokens +
+    (cloud.cached_tokens >= 0 ? ' · 缓存命中 ' + cloud.cached_tokens : '') : '—');
   if (!s.key_set) show('cloud', '待填写 API 密钥');
   else if (!s.wifi) show('cloud', '待连接 Wi-Fi');
   else if (!s.clock) show('cloud', '正在同步时钟');
@@ -512,10 +522,11 @@ function render(s) {
       Number(field('volume').value) === lastVolume) field('volume').value = s.volume;
   lastVolume = s.volume;
   show('wake', (s.wake_ready ? s.wake_word : '唤醒模型未加载') + (s.aec ? ' · AEC' : '') +
-    (s.listening ? ' · 收音中' : s.speaking ? ' · 播报中' : ''));
+    (s.listening ? ' · 收音中' : s.speaking ? ' · 播报中' :
+      s.followup_ms > 0 ? ' · 可以追问 ' + Math.ceil(s.followup_ms / 1000) + ' 秒' : ''));
   show('audio_io', 'I²S 读写错误 ' + s.i2s_rx_errors + ' / ' + s.i2s_tx_errors +
        ' · 播放缓冲耗尽 ' + s.playback_underruns + ' 次');
-  show('playback_result', ({complete:'完整播完',wake_word:'唤醒词打断',manual:'手动停止',
+  show('playback_result', ({complete:'完整播完',voice:'插话打断',wake_word:'唤醒词打断',manual:'手动停止',
     i2s_error:'I²S 读写错误',timeout:'等待音频超时',network_lost:'Wi-Fi 断开',
     cloud_error:'音频流异常'})[s.playback_result] || '—');
   show('transcript', cloud.transcript || '—');

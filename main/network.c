@@ -365,6 +365,7 @@ static esp_err_t get_status(httpd_req_t *req)
         cJSON_AddNumberToObject(json, "volume", audio_volume());
         cJSON_AddStringToObject(json, "doa", direction_name(audio.direction));
         cJSON_AddBoolToObject(json, "listening", audio.listening);
+        cJSON_AddNumberToObject(json, "followup_ms", audio.followup_ms);
         cJSON_AddBoolToObject(json, "speaking", audio.speaking);
         cJSON_AddBoolToObject(json, "aec", audio.aec);
         cJSON_AddBoolToObject(json, "wake_ready", audio.wake_ready);

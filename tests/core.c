@@ -1,4 +1,6 @@
 #include "audio_wire.h"
+#include "barge_in.h"
+#include "dialog_window.h"
 #include "grid.h"
 #include "intent.h"
 #include <assert.h>
@@ -69,6 +71,13 @@ static void test_intent(void)
     assert(volume.type == INTENT_VOLUME_SET && volume.volume == 30);
     volume = intent_from_transcript("音量调到十％", NULL);
     assert(volume.type == INTENT_VOLUME_SET && volume.volume == 10);
+    volume = intent_from_transcript("我说，音量调到2%。", NULL);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 2);
+    volume = intent_from_transcript("你好小智，我说，帮我把音量调到百分之二。", &wake_options[2]);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 2);
+    volume = intent_from_transcript("等一下，把音量调到2%。", NULL);
+    assert(volume.type == INTENT_VOLUME_SET && volume.volume == 2);
+    assert(intent_from_transcript("我说，音量调到2%会怎么样？", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("静音", NULL).volume == 0);
     assert(intent_from_transcript("你能告诉我怎么调大音量吗", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("音量调到101%", NULL).type == INTENT_CHAT);
@@ -190,6 +199,66 @@ static void test_wifi_rotation(void)
     puts("PASS ordered Wi-Fi startup, disconnect, timeout, fallback AP and recovery");
 }
 
+static void test_dialog_window(void)
+{
+    for (int round = 0; round < 3; ++round) {
+        int64_t opens = (int64_t)round * 20000000 + 250000;
+        dialog_window_t window = {.opens_us = opens, .expires_us = opens + DIALOG_WAIT_MS * 1000};
+        assert(!dialog_wait_step(&window, opens - 32 * 1000, true, true, 32));
+        assert(!dialog_wait_step(&window, opens, false, true, 32));
+        assert(!dialog_wait_step(&window, opens + 32000, true, false, 32));
+        assert(!dialog_wait_step(&window, opens + 64000, true, true, 32));
+        assert(!dialog_wait_step(&window, opens + 96000, true, true, 32));
+        assert(dialog_wait_step(&window, opens + 128000, true, true, 32));
+        assert(!dialog_wait_step(&window, opens + 160000, true, true, 32));
+    }
+    dialog_window_t quiet = {.opens_us = 250000, .expires_us = 8250000};
+    assert(!dialog_wait_step(&quiet, 8249999, true, false, 32) && quiet.expires_us);
+    assert(!dialog_wait_step(&quiet, 8250000, true, true, 32) && !quiet.expires_us);
+    assert(intent_from_transcript("不聊了。", NULL).type == INTENT_END_DIALOG);
+    assert(intent_from_transcript("不要结束对话。", NULL).type == INTENT_CHAT);
+    assert(intent_from_transcript("停下。", NULL).type == INTENT_STOP);
+    puts("PASS follow-up windows, echo guard, timeout and ending phrases");
+}
+
+static void test_barge_in(void)
+{
+    barge_in_t barge = {0};
+    for (int i = 0; i < 24; ++i) {
+        assert(!barge_in_step(&barge, 460, true, 530, 32));
+        assert(!barge.silence_ms);
+    }
+    // The speaker alone can cause a transient above threshold. Once muted,
+    // tail and a single loud tap must not cancel the pending PCM.
+    assert(!barge_in_step(&barge, 1300, true, 530, 32));
+    assert(!barge_in_step(&barge, 1300, true, 530, 32) && barge.silence_ms);
+    for (int i = 0; i < 6; ++i) {
+        barge_in_reference(&barge, 600, 32);
+        assert(!barge_in_near_mic(&barge));
+        assert(!barge_in_step(&barge, 1200, true, 530, 32));
+    }
+    while (!barge_in_near_mic(&barge)) {
+        barge_in_reference(&barge, 0, 32);
+        assert(!barge_in_step(&barge, 1200, true, 530, 32));
+    }
+    assert(!barge_in_step(&barge, 950, true, 530, 32));
+    while (barge.silence_ms) assert(!barge_in_step(&barge, 70, false, 530, 32));
+    assert(barge.retry_ms > 0);
+
+    // Speech continues after the echo tail and triggers a new recording.
+    for (int i = 0; i < 24; ++i) assert(!barge_in_step(&barge, 480, true, 530, 32));
+    assert(!barge_in_step(&barge, 1400, true, 530, 32));
+    assert(!barge_in_step(&barge, 1400, true, 530, 32) && barge.silence_ms);
+    while (!barge_in_near_mic(&barge)) {
+        barge_in_reference(&barge, 0, 32);
+        assert(!barge_in_step(&barge, 1100, false, 530, 32));
+    }
+    assert(!barge_in_step(&barge, 950, true, 530, 32));
+    assert(!barge_in_step(&barge, 840, true, 530, 32));
+    assert(barge_in_step(&barge, 840, true, 530, 32));
+    puts("PASS speech interruption, echo-only recovery and impulse rejection");
+}
+
 int main(void)
 {
     test_grid();
@@ -197,6 +266,8 @@ int main(void)
     test_speech_direction();
     test_wifi_profiles();
     test_wifi_rotation();
+    test_dialog_window();
+    test_barge_in();
     test_audio();
     return 0;
 }

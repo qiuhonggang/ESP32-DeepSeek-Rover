@@ -34,6 +34,7 @@ typedef struct {
     uint32_t id;
     size_t bytes;
     int64_t captured_at;
+    uint32_t speech_end_ms;
     direction_t direction;
     job_type_t type;
     uint8_t data[];
@@ -53,6 +54,29 @@ static atomic_int voice_pace = PACE_NORMAL;
 static atomic_uint playback_done, playback_failed;
 static atomic_bool initialized, text_debug_busy;
 static atomic_int flash_first_ms, flash_complete_ms, tts_first_ms;
+static atomic_int asr_ms, first_play_ms, tts_ws_ms;
+static atomic_int prompt_tokens = -1, completion_tokens = -1, cached_tokens = -1;
+static atomic_uint timing_id, timing_origin_ms;
+static atomic_bool http_reused;
+// Owned by the cloud task and kept only between ASR and the following Flash request.
+static esp_http_client_handle_t asr_connection;
+
+static int elapsed_ms(uint32_t start)
+{
+    return (int)((uint32_t)(esp_timer_get_time() / 1000) - start);
+}
+
+static void record_usage(const cJSON *body)
+{
+    const cJSON *usage = cJSON_GetObjectItemCaseSensitive(body, "usage");
+    if (!cJSON_IsObject(usage)) return;
+    const cJSON *input = cJSON_GetObjectItemCaseSensitive(usage, "prompt_tokens");
+    const cJSON *output = cJSON_GetObjectItemCaseSensitive(usage, "completion_tokens");
+    const cJSON *cached = cJSON_GetObjectItemCaseSensitive(usage, "prompt_cache_hit_tokens");
+    if (cJSON_IsNumber(input)) atomic_store(&prompt_tokens, input->valueint);
+    if (cJSON_IsNumber(output)) atomic_store(&completion_tokens, output->valueint);
+    if (cJSON_IsNumber(cached)) atomic_store(&cached_tokens, cached->valueint);
+}
 
 static void status(const char *state, int http, const char *text, const char *answer)
 {
@@ -91,6 +115,13 @@ cJSON *cloud_json(void)
     cJSON_AddNumberToObject(json, "flash_first_ms", atomic_load(&flash_first_ms));
     cJSON_AddNumberToObject(json, "flash_complete_ms", atomic_load(&flash_complete_ms));
     cJSON_AddNumberToObject(json, "tts_first_ms", atomic_load(&tts_first_ms));
+    cJSON_AddNumberToObject(json, "asr_ms", atomic_load(&asr_ms));
+    cJSON_AddNumberToObject(json, "first_play_ms", atomic_load(&first_play_ms));
+    cJSON_AddNumberToObject(json, "tts_ws_ms", atomic_load(&tts_ws_ms));
+    cJSON_AddBoolToObject(json, "http_reused", atomic_load(&http_reused));
+    cJSON_AddNumberToObject(json, "prompt_tokens", atomic_load(&prompt_tokens));
+    cJSON_AddNumberToObject(json, "completion_tokens", atomic_load(&completion_tokens));
+    cJSON_AddNumberToObject(json, "cached_tokens", atomic_load(&cached_tokens));
     cJSON_AddStringToObject(json, "voice_pace", voice_pace_name(atomic_load(&voice_pace)));
     if (has_hardware) cJSON_AddItemToObject(json, "hardware", harness_hardware_json(&last_hardware));
     xSemaphoreGive(status_lock);
@@ -132,6 +163,12 @@ bool cloud_debug_text(const char *text, const char *command)
 bool cloud_uplink(const uplink_t *packet)
 {
     if (!atomic_load(&initialized)) return false;
+    if (packet->type == UP_PLAY_BEGIN) {
+        if (packet->id == atomic_load(&timing_id)) {
+            atomic_store(&first_play_ms, (int)(packet->at_ms - atomic_load(&timing_origin_ms)));
+        }
+        return true;
+    }
     if (packet->type == UP_PLAY_DONE || packet->type == UP_PLAY_ABORT) {
         if (packet->type == UP_PLAY_DONE) atomic_store(&playback_done, packet->id);
         else atomic_store(&playback_failed, packet->id);
@@ -173,6 +210,7 @@ bool cloud_uplink(const uplink_t *packet)
         utterance_t *new_job = recording;
         recording = NULL;
         new_job->captured_at = esp_timer_get_time();
+        new_job->speech_end_ms = packet->at_ms;
         new_job->direction = packet->direction;
         if (new_job->bytes < 4800 || !network_ready()) {
             free(new_job);
@@ -222,27 +260,37 @@ static post_t open_post(const char *url, const char *type, const part_t *parts,
         .transport_type = HTTP_TRANSPORT_OVER_SSL, .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_redirect = true, .buffer_size = 4096, .buffer_size_tx = 4096,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return result;
     char authorization[sizeof(robot_config.api_key) + 8];
     snprintf(authorization, sizeof(authorization), "Bearer %s", robot_config.api_key);
-    esp_err_t auth = esp_http_client_set_header(client, "Authorization", authorization);
-    memset(authorization, 0, sizeof(authorization));
-    if (auth == ESP_OK && esp_http_client_set_header(client, "Content-Type", type) == ESP_OK &&
-        esp_http_client_open(client, (int)length) == ESP_OK &&
-        write_parts(client, parts, count, id) && current(id) &&
-        esp_http_client_fetch_headers(client) >= 0) {
-        result.http_status = esp_http_client_get_status_code(client);
-        if (result.http_status == 200) {
-            result.client = client;
-            return result;
+    esp_http_client_handle_t client = !strcmp(url, FLASH_URL) ? asr_connection : NULL;
+    bool reused = client != NULL;
+    if (reused) asr_connection = NULL;
+    for (;;) {
+        if (!client) client = esp_http_client_init(&config);
+        if (!client) break;
+        bool sent = (!reused || esp_http_client_set_url(client, url) == ESP_OK) &&
+            esp_http_client_set_header(client, "Authorization", authorization) == ESP_OK &&
+            esp_http_client_set_header(client, "Content-Type", type) == ESP_OK &&
+            esp_http_client_open(client, (int)length) == ESP_OK && write_parts(client, parts, count, id);
+        if (sent && current(id) && esp_http_client_fetch_headers(client) >= 0) {
+            result.http_status = esp_http_client_get_status_code(client);
+            if (result.http_status == 200) {
+                result.client = client;
+                if (reused) atomic_store(&http_reused, true);
+                break;
+            }
         }
+        esp_http_client_cleanup(client);
+        client = NULL;
+        // Retry a stale reused socket only before the full request was transmitted.
+        if (!reused || sent || !current(id)) break;
+        reused = false;
     }
-    esp_http_client_cleanup(client);
+    memset(authorization, 0, sizeof(authorization));
     return result;
 }
 
-static cJSON *read_json(post_t post, uint32_t id)
+static cJSON *read_json(post_t post, uint32_t id, bool keep_connection)
 {
     if (!post.client) return NULL;
     char *response = heap_caps_malloc(JSON_CAPACITY, MALLOC_CAP_SPIRAM);
@@ -264,7 +312,11 @@ static cJSON *read_json(post_t post, uint32_t id)
         }
         free(response);
     }
-    esp_http_client_cleanup(post.client);
+    if (answer && keep_connection && current(id) && esp_http_client_is_persistent_connection(post.client)) {
+        asr_connection = post.client;
+    } else {
+        esp_http_client_cleanup(post.client);
+    }
     return answer;
 }
 
@@ -282,7 +334,7 @@ static bool transcribe(const utterance_t *job, char *text, size_t size)
     };
     post_t post = open_post(ASR_URL, "multipart/form-data; boundary=" BOUNDARY,
                             parts, sizeof(parts) / sizeof(parts[0]), job->id);
-    cJSON *body = read_json(post, job->id);
+    cJSON *body = read_json(post, job->id, job->type == JOB_VOICE);
     const char *message = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(body, "text"));
     text_copy(text, size, message);
     cJSON_Delete(body);
@@ -294,12 +346,14 @@ static bool chat(const char *text, const char *expected, uint32_t id, bool inclu
                  const hardware_context_t *hardware, char *reply, size_t reply_size,
                  char *action, size_t action_size)
 {
+    uint32_t flash_at = esp_timer_get_time() / 1000;
     char *payload = harness_request(text, expected, include_context, false, hardware);
     if (!payload) return false;
     part_t part = {payload, strlen(payload)};
     post_t post = open_post(FLASH_URL, "application/json", &part, 1, id);
     cJSON_free(payload);
-    cJSON *body = read_json(post, id);
+    cJSON *body = read_json(post, id, false);
+    record_usage(body);
     cJSON *choices = cJSON_GetObjectItemCaseSensitive(body, "choices");
     cJSON *item = cJSON_GetArrayItem(choices, 0);
     cJSON *message = cJSON_GetObjectItemCaseSensitive(item, "message");
@@ -309,8 +363,10 @@ static bool chat(const char *text, const char *expected, uint32_t id, bool inclu
     text_copy(action, action_size, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "action")));
     cJSON_Delete(result);
     cJSON_Delete(body);
-    if (!reply[0] && current(id)) status("flash_error", post.http_status, NULL, NULL);
-    return reply[0] != 0;
+    bool valid = strcmp(expected, "none") ? action[0] != 0 : reply[0] != 0;
+    if (valid) atomic_store(&flash_complete_ms, elapsed_ms(flash_at));
+    if (!valid && current(id)) status("flash_error", post.http_status, NULL, NULL);
+    return valid;
 }
 
 static bool enqueue_pcm(uint32_t id, const int16_t *pcm, size_t samples)
@@ -327,16 +383,17 @@ static bool finish_playback(uint32_t id)
 {
     audio_end_play(id);
     int64_t deadline = esp_timer_get_time() + 3500000;
-    while (current(id) && esp_timer_get_time() < deadline) {
+    while (esp_timer_get_time() < deadline) {
         if (atomic_load(&playback_done) == id) return true;
-        if (atomic_load(&playback_failed) == id) break;
+        if (atomic_load(&playback_failed) == id || !current(id)) break;
         vTaskDelay(pdMS_TO_TICKS(25));
     }
     return false;
 }
 
-static bool speak(const char *reply, uint32_t id, bool isolated)
+static bool speak(const char *reply, uint32_t id)
 {
+    uint32_t tts_at = esp_timer_get_time() / 1000;
     cJSON *payload = cJSON_CreateObject();
     if (!payload) return false;
     cJSON_AddStringToObject(payload, "text", reply);
@@ -354,7 +411,7 @@ static bool speak(const char *reply, uint32_t id, bool isolated)
     }
     atomic_store(&playback_done, 0);
     atomic_store(&playback_failed, 0);
-    bool ok = audio_begin_play(id, isolated);
+    bool ok = audio_begin_play(id, false);
     size_t total = 0;
     int read_result = 0;
     bool complete = false;
@@ -374,6 +431,7 @@ static bool speak(const char *reply, uint32_t id, bool isolated)
                 ok = false;
                 break;
             }
+            if (!total) atomic_store(&tts_first_ms, elapsed_ms(tts_at));
             total += bytes;
             size_t samples = pcm_resample_24_to_18(&resampler, input, bytes, output,
                                                    sizeof(output) / sizeof(output[0]));
@@ -401,6 +459,8 @@ typedef struct {
     esp_websocket_client_handle_t client;
     uint8_t *pcm;
     atomic_uint pcm_bytes;
+    atomic_uint first_pcm_at;
+    uint32_t open_at, first_text_at;
     atomic_bool connected, failed, finished;
     unsigned opcode;
     size_t notice_bytes;
@@ -412,6 +472,7 @@ static void tts_stream_event(void *context, esp_event_base_t base, int32_t event
     (void)base;
     tts_stream_t *stream = context;
     if (event == WEBSOCKET_EVENT_CONNECTED) {
+        atomic_store(&tts_ws_ms, elapsed_ms(stream->open_at));
         atomic_store(&stream->connected, true);
     } else if (event == WEBSOCKET_EVENT_ERROR || event == WEBSOCKET_EVENT_DISCONNECTED ||
                event == WEBSOCKET_EVENT_CLOSED) {
@@ -431,6 +492,7 @@ static void tts_stream_event(void *context, esp_event_base_t base, int32_t event
             atomic_store(&stream->failed, true);
         } else if (bytes) {
             memcpy(stream->pcm + offset, data->data_ptr, bytes);
+            if (!offset) atomic_store(&stream->first_pcm_at, esp_timer_get_time() / 1000);
             atomic_store(&stream->pcm_bytes, offset + bytes);
         }
     } else if (stream->opcode == 1) {
@@ -457,6 +519,7 @@ static void tts_stream_event(void *context, esp_event_base_t base, int32_t event
 
 static void tts_stream_open(tts_stream_t *stream)
 {
+    stream->open_at = esp_timer_get_time() / 1000;
     char uri[112];
     snprintf(uri, sizeof(uri), TTS_WS_URL "?voice_id=%s&format=pcm", robot_config.voice);
     char headers[sizeof(robot_config.api_key) + 32];
@@ -483,6 +546,7 @@ static bool tts_stream_send(tts_stream_t *stream, const char *text)
     char *encoded = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     if (!encoded) return false;
+    if (text && !stream->first_text_at) stream->first_text_at = esp_timer_get_time() / 1000;
     int bytes = strlen(encoded);
     bool ok = esp_websocket_client_send_text(stream->client, encoded, bytes, pdMS_TO_TICKS(650)) == bytes;
     cJSON_free(encoded);
@@ -490,14 +554,16 @@ static bool tts_stream_send(tts_stream_t *stream, const char *text)
 }
 
 static bool tts_stream_pump(tts_stream_t *stream, uint32_t id, bool *started,
-                            size_t *consumed, pcm_resampler_t *resampler, int64_t start)
+                            size_t *consumed, pcm_resampler_t *resampler)
 {
     if (atomic_load(&stream->failed) || atomic_load(&playback_failed) == id || !current(id)) return false;
     size_t available = atomic_load(&stream->pcm_bytes);
     if (available > 0 && !*started) {
         if (!audio_begin_play(id, false)) return false;
         *started = true;
-        atomic_store(&tts_first_ms, (int)((esp_timer_get_time() - start) / 1000));
+        if (stream->first_text_at) {
+            atomic_store(&tts_first_ms, (int)(atomic_load(&stream->first_pcm_at) - stream->first_text_at));
+        }
         status("speaking", 200, NULL, NULL);
     }
     while (*consumed < available && current(id)) {
@@ -545,6 +611,7 @@ static bool flash_stream_event(char *line, char *reply, size_t capacity, size_t 
         cJSON_Delete(body);
         return false;
     }
+    record_usage(body);
     cJSON *choice = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(body, "choices"), 0);
     const char *finish = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(choice, "finish_reason"));
     const char *content = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(
@@ -607,7 +674,7 @@ static bool stream_chat(const char *text, uint32_t id, bool include_context,
             if (valid && atomic_load(&stream.connected) && !atomic_load(&stream.failed) &&
                 !flush_stream_text(&stream, reply, &sent, length, false)) atomic_store(&stream.failed, true);
             if (!atomic_load(&stream.failed) &&
-                !tts_stream_pump(&stream, id, &started, &consumed, &resampler, start)) {
+                !tts_stream_pump(&stream, id, &started, &consumed, &resampler)) {
                 atomic_store(&stream.failed, true);
             }
         }
@@ -626,7 +693,7 @@ static bool stream_chat(const char *text, uint32_t id, bool include_context,
     if (valid && flush_stream_text(&stream, reply, &sent, length, true)) {
         int64_t deadline = esp_timer_get_time() + 35000000;
         while (esp_timer_get_time() < deadline &&
-               tts_stream_pump(&stream, id, &started, &consumed, &resampler, start)) {
+               tts_stream_pump(&stream, id, &started, &consumed, &resampler)) {
             if (atomic_load(&stream.finished) && consumed == atomic_load(&stream.pcm_bytes)) {
                 int16_t tail[2];
                 spoken = consumed >= 6 && !resampler.has_partial &&
@@ -644,7 +711,7 @@ static bool stream_chat(const char *text, uint32_t id, bool include_context,
     if (!started && valid) {
         ESP_LOGW(TAG, "Streaming TTS unavailable before playback, using HTTP TTS");
         status("tts", 0, NULL, reply);
-        return speak(reply, id, false);
+        return speak(reply, id);
     }
     status(valid ? "tts_error" : "flash_error", post.http_status, NULL, NULL);
     if (started) audio_cancel_turn(id);
@@ -666,6 +733,7 @@ static const char *intent_name(intent_t intent)
         case INTENT_VOICE_PACE:
         case INTENT_MOTOR_LOCK:
         case INTENT_MOTOR_ENABLE:
+        case INTENT_END_DIALOG:
         case INTENT_CHAT: return "none";
     }
     return "none";
@@ -706,25 +774,66 @@ static const char *try_drive(intent_t intent, uint32_t turn)
     return NULL;
 }
 
-static const char *perform_local(intent_t intent)
+typedef struct { const char *text; const uint8_t *start, *end; } local_clip_t;
+#define LOCAL_CLIP(name, phrase) \
+    extern const uint8_t reply_##name##_start[] asm("_binary_reply_" #name "_pcm_start"); \
+    extern const uint8_t reply_##name##_end[] asm("_binary_reply_" #name "_pcm_end"); \
+    static const local_clip_t name##_clip = {phrase, reply_##name##_start, reply_##name##_end}
+LOCAL_CLIP(stop, "我停下啦。");
+LOCAL_CLIP(lock, "轮子锁好了。");
+LOCAL_CLIP(soft, "我小声一点。");
+LOCAL_CLIP(loud, "我大声一点。");
+LOCAL_CLIP(volume, "音量调好啦。");
+LOCAL_CLIP(slow, "下次慢一点。");
+LOCAL_CLIP(fast, "下次快一点。");
+LOCAL_CLIP(normal, "恢复正常速度。");
+LOCAL_CLIP(bye, "好，下次聊。");
+#undef LOCAL_CLIP
+
+static bool speak_clip(const local_clip_t *clip, uint32_t id)
+{
+    atomic_store(&playback_done, 0);
+    atomic_store(&playback_failed, 0);
+    if (!audio_begin_play(id, false)) {
+        if (current(id)) status("tts_error", 0, NULL, NULL);
+        return false;
+    }
+    for (const uint8_t *pcm = clip->start; pcm < clip->end;) {
+        size_t bytes = clip->end - pcm;
+        if (bytes > MAX_WIRE_BYTES) bytes = MAX_WIRE_BYTES;
+        if (!enqueue_pcm(id, (const int16_t *)pcm, bytes / sizeof(int16_t))) break;
+        pcm += bytes;
+        if (pcm == clip->end && finish_playback(id)) return true;
+    }
+    if (current(id)) status("tts_error", 0, NULL, NULL);
+    audio_cancel_turn(id);
+    return false;
+}
+
+static const char *perform_local(intent_t intent, uint32_t id, const local_clip_t **clip)
 {
     switch (intent.type) {
         case INTENT_DRIVE:
             return drive_block_reason(intent.action);
         case INTENT_STOP:
             nav_stop(false);
-            return "好，我停在这儿。";
+            *clip = &stop_clip;
+            break;
         case INTENT_MOTOR_LOCK:
             nav_stop(true);
-            return "我停好啦，轮子也锁上了。";
+            *clip = &lock_clip;
+            break;
+        case INTENT_END_DIALOG:
+            audio_end_dialog(id);
+            *clip = &bye_clip;
+            break;
         case INTENT_MOTOR_ENABLE:
             return motion_status().armed ? "我的轮子已经准备好啦。你想让我往哪边走？" :
                 "请大人在我的网页上开启电机。我在这儿等你。";
         case INTENT_VOICE_PACE:
             atomic_store(&voice_pace, intent.pace);
-            if (intent.pace == PACE_SLOW) return "好，下次走的时候我慢一点。";
-            if (intent.pace == PACE_FAST) return "好，下次走的时候我快一点。";
-            return "我们换回平常的速度吧。";
+            *clip = intent.pace == PACE_SLOW ? &slow_clip : intent.pace == PACE_FAST ? &fast_clip : &normal_clip;
+            break;
         case INTENT_VOLUME_SET:
         case INTENT_VOLUME_CHANGE: {
             int applied;
@@ -732,12 +841,13 @@ static const char *perform_local(intent_t intent)
                 return "我刚才没调好声音，再试一下吧。";
             }
             if (applied == 0) return "好，我先安静一会儿。";
-            if (applied == 75 && intent.volume > 0) return "我已经把声音调到最大啦。";
-            if (intent.type == INTENT_VOLUME_SET) return "好，我把声音调好啦。";
-            return intent.volume > 0 ? "这样听得清楚些吗？" : "我小声一点跟你说。";
+            if (applied == 75 || intent.type == INTENT_VOLUME_SET) *clip = &volume_clip;
+            else *clip = intent.volume > 0 ? &loud_clip : &soft_clip;
+            break;
         }
         default: return NULL;
     }
+    return (*clip)->text;
 }
 
 static const char *perform(intent_t intent, direction_t direction, uint32_t turn)
@@ -764,11 +874,33 @@ static const char *perform(intent_t intent, direction_t direction, uint32_t turn
     }
 }
 
+static void close_asr_connection(void)
+{
+    if (asr_connection) esp_http_client_cleanup(asr_connection);
+    asr_connection = NULL;
+}
+
+static void finish_dialog(uint32_t id)
+{
+    if (current(id)) status("idle", 200, NULL, NULL);
+}
+
 static void handle(utterance_t *job)
 {
     uint32_t id = job->id;
     if (!current(id)) return;
     char text[243] = {0}, reply[301] = {0}, action[32] = {0};
+    atomic_store(&timing_id, 0);
+    atomic_store(&asr_ms, 0);
+    atomic_store(&first_play_ms, 0);
+    atomic_store(&tts_ws_ms, 0);
+    atomic_store(&prompt_tokens, -1);
+    atomic_store(&completion_tokens, -1);
+    atomic_store(&cached_tokens, -1);
+    atomic_store(&http_reused, false);
+    atomic_store(&timing_origin_ms,
+        job->type <= JOB_ASR_ONLY ? job->speech_end_ms : esp_timer_get_time() / 1000);
+    atomic_store(&timing_id, id);
     atomic_store(&flash_first_ms, 0);
     atomic_store(&flash_complete_ms, 0);
     atomic_store(&tts_first_ms, 0);
@@ -793,33 +925,47 @@ static void handle(utterance_t *job)
     if (job->type == JOB_TEXT_TTS) {
         const char *prompt = (const char *)job->data;
         status("tts", 0, "", prompt);
-        if (speak(prompt, id, true) && current(id)) status("tts_done", 200, NULL, NULL);
+        if (speak(prompt, id) && current(id)) status("tts_done", 200, NULL, NULL);
         return;
     }
     status("asr", 0, NULL, NULL);
-    if (!transcribe(job, text, sizeof(text)) || !current(id)) return;
+    uint32_t asr_at = esp_timer_get_time() / 1000;
+    bool transcribed = transcribe(job, text, sizeof(text));
+    atomic_store(&asr_ms, elapsed_ms(asr_at));
+    if (!transcribed || !current(id)) {
+        audio_end_dialog(id);
+        return;
+    }
     if (job->type == JOB_ASR_ONLY) {
         snapshot_hardware(job->direction);
         status("asr_done", 200, text, "");
         return;
     }
     intent_t intent = intent_from_transcript(text, audio_selected_wake());
-    const char *local = perform_local(intent);
+    const local_clip_t *clip = NULL;
+    const char *local = perform_local(intent, id, &clip);
     hardware_context_t hardware = snapshot_hardware(job->direction);
     if (local) {
+        close_asr_connection();
         if (!audio_volume()) {
             status("idle", 200, text, local);
+            audio_offer_followup(id);
+        } else if (clip) {
+            status("speaking", 0, text, local);
+            if (speak_clip(clip, id)) finish_dialog(id);
         } else {
             status("tts", 0, text, local);
-            if (speak(local, id, false) && current(id)) status("idle", 200, NULL, NULL);
+            if (speak(local, id)) finish_dialog(id);
         }
         return;
     }
     if (intent.type == INTENT_CHAT) {
         status("flash", 0, text, "");
-        if (stream_chat(text, id, true, &hardware, reply, sizeof(reply)) && current(id)) {
+        if (stream_chat(text, id, true, &hardware, reply, sizeof(reply))) {
             harness_add_turn(text, reply);
-            status("idle", 200, NULL, reply);
+            finish_dialog(id);
+        } else {
+            audio_end_dialog(id);
         }
         return;
     }
@@ -845,9 +991,9 @@ static void handle(utterance_t *job)
     }
     if (!current(id)) return;
     status("tts", 0, text, reply);
-    if (speak(reply, id, false)) {
-        if (successful && current(id)) harness_add_turn(text, reply);
-        if (current(id)) status("idle", 200, NULL, NULL);
+    if (speak(reply, id)) {
+        if (successful) harness_add_turn(text, reply);
+        finish_dialog(id);
     }
 }
 
@@ -858,6 +1004,7 @@ static void cloud_task(void *unused)
         utterance_t *job;
         if (xQueueReceive(jobs, &job, portMAX_DELAY) == pdTRUE) {
             handle(job);
+            close_asr_connection();
             release_job(job);
         }
     }

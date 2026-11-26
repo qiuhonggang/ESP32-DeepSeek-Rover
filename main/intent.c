@@ -149,6 +149,15 @@ static int volume_number(const char *text)
 
 static void volume_intent(const char *text, intent_t *intent)
 {
+    const char *const lead_ins[] = {"等一下", "等等", "我说", "帮我", "给我"};
+    for (size_t i = 0; i < sizeof(lead_ins) / sizeof(lead_ins[0]); ++i) {
+        const char *after = consume(text, lead_ins[i]);
+        if (after) {
+            text = after;
+            size_t skip;
+            while ((skip = pause_separator(text)) != 0) text += skip;
+        }
+    }
     const char *bare = consume(text, "把");
     if (bare) text = bare;
     const char *const louder[] = {"大声一点", "大声点", "声音大一点", "声音大点", "声音调大一点",
@@ -216,6 +225,8 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
         while ((skip = pause_separator(text)) != 0) text += skip;
     }
 
+    const char *const end_dialog[] = {"不聊了", "先不聊了", "退出对话", "结束对话", NULL};
+    if (in(text, end_dialog)) { result.type = INTENT_END_DIALOG; return result; }
     const char *const stop[] = {"停", "停下", "停下来", "停止", "停止巡游", "停止导航",
                                 "别动", "不要动", "停车", "停下吧", NULL};
     if (in(text, stop)) { result.type = INTENT_STOP; return result; }
