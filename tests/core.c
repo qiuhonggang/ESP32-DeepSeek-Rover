@@ -3,6 +3,7 @@
 #include "dialog_window.h"
 #include "grid.h"
 #include "intent.h"
+#include "tts_text.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -225,6 +226,18 @@ static void test_barge_in(void)
 {
     barge_in_t barge = {0};
     for (int i = 0; i < 24; ++i) {
+        barge_in_reference(&barge, i % 2 ? 0 : 1400, 32);
+        assert(!barge_in_step(&barge, i < 4 ? 600 : 2500, true, 530, 32));
+        assert(!barge.silence_ms);
+    }
+    // Near-end speech can still start a confirmation over audible playback.
+    for (int i = 0; i < 2; ++i) {
+        barge_in_reference(&barge, 1400, 32);
+        assert(!barge_in_step(&barge, 4600, true, 530, 32));
+    }
+    assert(barge.silence_ms);
+    barge = (barge_in_t){0};
+    for (int i = 0; i < 24; ++i) {
         assert(!barge_in_step(&barge, 460, true, 530, 32));
         assert(!barge.silence_ms);
     }
@@ -259,6 +272,30 @@ static void test_barge_in(void)
     puts("PASS speech interruption, echo-only recovery and impulse rejection");
 }
 
+static void test_tts_segments(void)
+{
+    const char *story = "你好呀。今天我们去看星星";
+    size_t first = strlen("你好呀。");
+    assert(tts_text_segment(story, first - 1, false) == 0);
+    assert(tts_text_segment(story, first, false) == first);
+    assert(tts_text_segment(story, strlen(story), false) == first);
+    assert(tts_text_segment(story + first, strlen(story + first), false) == 0);
+    assert(tts_text_segment(story + first, strlen(story + first), true) == strlen(story + first));
+
+    const char *pause = "我们今天去看海，";
+    assert(tts_text_segment(pause, strlen(pause), false) == strlen(pause));
+    assert(tts_text_segment("好呀，", strlen("好呀，"), false) == 0);
+    const char *distance = "前面还有12.5厘米。";
+    assert(tts_text_segment(distance, strlen("前面还有12."), false) == 0);
+    assert(tts_text_segment(distance, strlen(distance), false) == strlen(distance));
+
+    const char *long_line = "一二三四五六七八九十一二三四五六七八九十一二三四五";
+    size_t hard = strlen(long_line) - strlen("五");
+    assert(tts_text_segment(long_line, hard - 1, false) == 0);
+    assert(tts_text_segment(long_line, strlen(long_line), false) == hard);
+    puts("PASS TTS incremental sentences, pauses, UTF-8 boundaries, decimals and final tail");
+}
+
 int main(void)
 {
     test_grid();
@@ -269,5 +306,6 @@ int main(void)
     test_dialog_window();
     test_barge_in();
     test_audio();
+    test_tts_segments();
     return 0;
 }

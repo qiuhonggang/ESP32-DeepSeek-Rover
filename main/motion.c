@@ -2,6 +2,7 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
@@ -66,12 +67,17 @@ motion_status_t motion_status(void)
     return copy;
 }
 
-static void finish_locked(motion_result_t result, int64_t now)
+static void stop_locked(int64_t now)
 {
-    if (status.result == MOTION_RUNNING) status.result = result;
     if (status.moving) brake_until = now + 100000;
     command.action = STOP;
     status.action = STOP;
+}
+
+static void finish_locked(motion_result_t result, int64_t now)
+{
+    if (status.result == MOTION_RUNNING) status.result = result;
+    stop_locked(now);
 }
 
 void motion_stop(bool disarm)
@@ -89,7 +95,7 @@ bool motion_arm(void)
 {
     taskENTER_CRITICAL(&guard);
     int64_t now = esp_timer_get_time();
-    bool allowed = initialized && status.result != MOTION_RUNNING &&
+    bool allowed = initialized && !status.output_fault && status.result != MOTION_RUNNING &&
                    now >= brake_until && shift_allowed(FORWARD, now);
     if (allowed) {
         status.armed = true;
@@ -196,14 +202,43 @@ static void sonar_task(void *unused)
     }
 }
 
-static void pair(int motor, int speed, bool brake)
+static esp_err_t set_motor_duty(ledc_channel_t channel, uint32_t duty)
+{
+    // Only the motor task updates these channels, and it never uses LEDC fade.
+    esp_err_t error = ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
+    if (error != ESP_OK) return error;
+    return ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
+}
+
+static esp_err_t pair(int motor, int speed, bool brake)
 {
     int first = speed > 0 ? speed : 0;
     int second = speed < 0 ? -speed : 0;
     if (brake) first = second = 255;
     int channel = motor * 2;
-    ledc_set_duty_and_update(LEDC_LOW_SPEED_MODE, channel, first, 0);
-    ledc_set_duty_and_update(LEDC_LOW_SPEED_MODE, channel + 1, second, 0);
+    esp_err_t error = set_motor_duty(channel, first);
+    if (error != ESP_OK) return error;
+    return set_motor_duty(channel + 1, second);
+}
+
+static void motor_output_failed(int motor, esp_err_t error)
+{
+    gpio_set_level(PIN_SLEEP, 0);
+    taskENTER_CRITICAL(&guard);
+    stop_locked(esp_timer_get_time());
+    status.armed = status.moving = false;
+    status.output_fault = true;
+    status.result = MOTION_ABORTED;
+    brake_until = armed_until = 0;
+    taskEXIT_CRITICAL(&guard);
+
+    for (int channel = 0; channel < sizeof(MOTOR_PINS) / sizeof(MOTOR_PINS[0]); ++channel) {
+        esp_err_t stop_error = ledc_stop(LEDC_LOW_SPEED_MODE, channel, 0);
+        if (stop_error != ESP_OK) {
+            ESP_LOGE("motion", "Failed to stop PWM channel %d (%s)", channel, esp_err_to_name(stop_error));
+        }
+    }
+    ESP_LOGE("motion", "PWM update failed for motor %d (%s). Chassis locked", motor, esp_err_to_name(error));
 }
 
 static void motor_task(void *unused)
@@ -216,6 +251,7 @@ static void motor_task(void *unused)
     while (true) {
         int64_t now = esp_timer_get_time();
         int output[4] = {0};
+        uint32_t finished_ticket = 0;
         taskENTER_CRITICAL(&guard);
         if (status.armed && now >= armed_until) status.armed = false;
         if (command.action != STOP) {
@@ -226,7 +262,10 @@ static void motor_task(void *unused)
                     command.started = now;
                     command.until = now + (int64_t)command.duration_ms * 1000;
                 }
-                if (now >= command.until) finish_locked(MOTION_DONE, now);
+                if (now >= command.until) {
+                    finished_ticket = status.ticket;
+                    stop_locked(now);
+                }
             }
         }
         int left = 0, right = 0;
@@ -253,12 +292,23 @@ static void motor_task(void *unused)
 
         if (enabled && !last_enable) gpio_set_level(PIN_SLEEP, 1);
         for (int i = 0; i < 4; ++i) {
-            if (output[i] != previous[i] || brake != last_brake) pair(i, output[i], brake);
+            if (output[i] == previous[i] && brake == last_brake) continue;
+            esp_err_t error = pair(i, output[i], brake);
+            if (error != ESP_OK) {
+                motor_output_failed(i, error);
+                vTaskDelete(NULL);
+                return;
+            }
             previous[i] = output[i];
         }
         if (!enabled && last_enable) gpio_set_level(PIN_SLEEP, 0);
         last_enable = enabled;
         last_brake = brake;
+        if (finished_ticket) {
+            taskENTER_CRITICAL(&guard);
+            if (status.ticket == finished_ticket && status.result == MOTION_RUNNING) status.result = MOTION_DONE;
+            taskEXIT_CRITICAL(&guard);
+        }
         vTaskDelayUntil(&next, pdMS_TO_TICKS(10));
     }
 }

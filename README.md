@@ -1,15 +1,15 @@
 # ESP32-S3 DeepSeek 四驱小车
 
-ESP32-S3 N16R8 是唯一车载控制器，双 INMP441 负责唤醒、语音输入和左右声源定位，MAX98357A 驱动 3070 喇叭。ESP32 通过 HTTPS 直接访问 DeepSeek ASR、Flash 和 TTS。四路电机控制、声学前处理、测距急停、网格建图和寻路都在车上完成。
+ESP32-S3 N16R8 是唯一车载控制器，双 INMP441 负责唤醒、语音输入和左右声源定位，MAX98357A 驱动 3070 喇叭。ESP32 直接连接 DeepSeek 识别和生成回复，再用 DeepSeek 或乐鑫本地合成语音。四路电机控制、声学前处理、测距急停、网格建图和寻路都在车上完成。
 
-**当前源码版本 1.0.10。** 唤醒一次后，播报时可直接插话，播完可直接追问。小车可记住 **5 个 2.4 GHz Wi-Fi**，开机后单独长按 **BOOT 约 3 秒**可手动开配网热点。 [连续对话、延迟与用量](#连续对话延迟与用量) · [管理多个 Wi-Fi](#管理多个-wi-fi) · [长按 BOOT 开启配网热点](#长按-boot-开启配网热点)
+**当前源码版本 1.0.13。** 唤醒一次后，播报时可直接插话，播完可直接追问。小车可记住 **5 个 2.4 GHz Wi-Fi**，开机后单独长按 **BOOT 约 3 秒**可手动开配网热点。 [选择语音合成](#选择语音合成) · [连续对话、延迟与用量](#连续对话延迟与用量) · [管理多个 Wi-Fi](#管理多个-wi-fi) · [长按 BOOT 开启配网热点](#长按-boot-开启配网热点)
 
 | 功能 | 当前实现 |
 | --- | --- |
 | 配网 | 保存最多 5 个 Wi-Fi，网页添加、删除和排序。全部失败后自动开热点，也可长按 BOOT 手动开启 |
 | 本地唤醒 | ESP-SR WakeNet9 / WakeNet10 共 20 个预置词，默认「嗨小象」。网页选词，唤醒后轮换播放四条本地应答 |
 | 双麦和插话 | 双声道采样、左右声源定位、I²S 回声抵消。播报时可直接开口打断 |
-| 云端语音 | 16 kHz 单声道 WAV → DeepSeek ASR → `deepseek-flash` SSE → DeepSeek TTS WebSocket。边接收边播，云端语音约 0.89 倍速 |
+| 语音合成 | DeepSeek ASR → `deepseek-flash` SSE → DeepSeek WebSocket 或乐鑫本地中文 TTS，两种模式均可边生成边播 |
 | 硬件问答 | 本轮双麦方位、车头测距、电机状态、音量和语音速度档随问答送给 Flash |
 | 语音控制 | 音量、静音、前进后退、转向、慢／正常／快、停车和锁定电机 |
 | 连续对话与记忆 | 每次播完后可直接追问 8 秒。启用历史时，NVS 保存最近 12 轮已播完的对话，每次问答最多发送最近 3 轮 |
@@ -21,7 +21,7 @@ ESP32-S3 N16R8 是唯一车载控制器，双 INMP441 负责唤醒、语音输�
 
 ## 烧录
 
-源码用 ESP-IDF 6.0.2 编译。**首次烧录请刷全部四段**，包括程序、分区表、bootloader 和 WakeNet 模型。配置、地图和记忆存放在独立 NVS 分区。当前版本可直接从源码构建。
+源码用 ESP-IDF 6.0.2 编译。**首次烧录，或上一次完整烧录的版本为 1.0.10 及更早版本，请执行完整的 `idf.py -p PORT flash`。** 它会写入 bootloader、分区表、应用、WakeNet 模型和乐鑫小乐音色五段。新音色位于 `voice_data` 分区，偏移为 `0xb10000`，占用 3 MiB 分区空间。完整烧录保留原有 NVS，Wi-Fi、API Key、地图和记忆可继续使用。
 
 如果手头有对应版本的预编译烧录包，可以解压后进入烧录目录。将 `PORT` 替换为你的串口，例如 `/dev/cu.usbmodemXXXX` 或 `/dev/cu.usbserial-XXXX`。
 
@@ -40,9 +40,7 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
-**从 1.0.0 或 1.0.1 更新到 1.0.2** 时，用新烧录包的四段完整写入，包括扩容后的分区表和新 `srmodels.bin`。应用、模型和 NVS 的起始偏移沿用旧版，模型分区从 3 MiB 扩为 8 MiB。用包内命令分段写入并保留 NVS，已有的唤醒词设置、Wi-Fi、DeepSeek Key、地图和对话记忆均可沿用。
-
-已完整烧录 1.0.2 的分区表和模型的设备，可以在编译后用 `idf.py -p PORT app-flash` 更新到 1.0.10，并保留 NVS 中的设置和记忆。旧版保存的单个 Wi-Fi 会自动迁移为列表第一项，原有密码可继续使用。
+刷过 1.0.11 完整固件后，日后仅应用有变化时可用 `idf.py -p PORT app-flash`。旧版保存的单个 Wi-Fi 会自动迁移为列表第一项。
 
 串口速率为 115200。若开发板有 USB 和 UART 两个接口，首次接线可选带 USB 转串口的 UART 接口读日志，或使用板上 USB Serial/JTAG 口。串口显示 `WakeNet ready: 嗨小象 (...)` 或所选词的名称，代表模型初始化完成。 [ESP32-S3 DevKitC 手册](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html) · [WakeNet 文档](https://docs.espressif.com/projects/esp-sr/en/latest/esp32s3/wake_word_engine/README.html)
 
@@ -73,22 +71,29 @@ idf.py -p PORT flash monitor
 
 ## 对话链路与数据
 
-管理网页使用 HTTP，可通过配网热点或可信局域网访问。固件使用 HTTPS/WSS 和证书校验连接 `api.deepseek.com`。DeepSeek API 密钥写入设备 NVS。唤醒后的录音送给 ASR，转写、本轮硬件读数及启用的对话上下文送给 Flash，回复文本送给 TTS。 [DeepSeek ASR](https://api-docs.deepseek.com/zh-cn/guides/asr/) · [Flash JSON 输出](https://api-docs.deepseek.com/zh-cn/guides/json_mode/) · [DeepSeek TTS](https://api-docs.deepseek.com/zh-cn/guides/tts/)
+管理网页使用 HTTP，可通过配网热点或可信局域网访问。固件使用 HTTPS/WSS 和证书校验连接 `api.deepseek.com`。DeepSeek API 密钥写入设备 NVS。唤醒后的录音送给 ASR，转写、本轮硬件读数及启用的对话上下文送给 Flash。回复由所选引擎合成，选择乐鑫时在车上完成合成。 [DeepSeek ASR](https://api-docs.deepseek.com/zh-cn/guides/asr/) · [Flash JSON 输出](https://api-docs.deepseek.com/zh-cn/guides/json_mode/)
 
-DeepSeek ASR 接收完整 WAV 后返回一次转写。普通对话把 Flash SSE 的文本增量分段送给 TTS WebSocket，边接收 PCM 边排队播报。流式 TTS 若在出声前失败，会用已生成的回复改走 HTTP TTS。动作确认走完整的 Flash JSON 校验流程。官方 TTS 没有语速参数，固件将云端播报放慢至约 0.89 倍，音高也会略降。 [Flash SSE](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/) · [TTS WebSocket](https://api-docs.deepseek.com/zh-cn/guides/tts/#websocket-流式合成)
+DeepSeek ASR 接收完整 WAV 后返回一次转写。普通对话以 Flash SSE 接收回复文字。可执行动作先通过完整的 Flash JSON 校验，再播报实际执行结果。 [Flash SSE](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/)
+
+## 选择语音合成
+
+在管理页「Wi-Fi、DeepSeek 与参数」里选择「语音合成」，点「保存并重启」。旧设置升级后的默认项是 **DeepSeek（云端）**。
+
+- **DeepSeek（云端）**把 Flash 的文本增量分段送入 WebSocket，收到 PCM 即入队。WebSocket 若在开始播放前不可用，改用 HTTP TTS，音频仍分块接收。云端播报约为原声的 0.89 倍速。 [DeepSeek TTS 官方接口](https://api-docs.deepseek.com/zh-cn/guides/tts/)
+- **乐鑫小乐（本地中文）**把 Flash 的文本流按标点或短句切分，在车上逐段合成 16 kHz PCM。收到首段后就能开始合成，播放沿用双麦插话与停止功能。普通对话仍需要联网进行 ASR 和 Flash。「只测 TTS 播报」可以通过配网热点单独测试本地合成，无需云端连接。 [乐鑫本地 TTS](https://docs.espressif.com/projects/esp-sr/zh_CN/latest/esp32s3/speech_synthesis/readme.html)
 
 ## 连续对话、延迟与用量
 
 - 说一次唤醒词。播报中可以直接插话。每次回复完整播完、回声保护结束后，小车等 **8 秒**，可以直接追问。等待期间用本地语音检测，检测到话音才录音，录完才请求 ASR。说「不聊了」、点网页「停止语音」、等待超时或掉线都会结束。
 - ASR 响应完整且允许保持连接时，随后的 Flash 请求复用 HTTPS。普通聊天保持 Flash 文本与 TTS 音频流式处理。停车、锁电机、常见音量调整、速度档和结束对话使用嵌入的 Kokoro 短确认语，省去这些确认的云端 TTS 请求。
 - Flash 普通聊天最多发送最近 3 轮截短的历史。设备读数和地图按问题需要附带。可执行的动作只请 Flash 返回动作名，由小车做原有动作校验并给出确认。关闭「保存近期对话」后仍可连续追问，每轮按当前问题回复。
-- 后台「本轮耗时」显示 ASR、Flash、TTS 和从检测到说完到首帧交给 I²S 的耗时。TTS WebSocket 建连时间单独显示。Flash 返回用量时，后台显示输入、输出与缓存命中 Token。
+- 后台「本轮耗时」显示实际合成路径、ASR、Flash、TTS 和从检测到说完到首帧交给 I²S 的耗时。TTS WebSocket 建连时间单独显示。Flash 返回用量时，后台显示输入、输出与缓存命中 Token。
 
 ## 选择本地唤醒词
 
 进入网页「Wi-Fi、DeepSeek 与参数」，在「本地唤醒词」里任选一个，再点「保存并重启」。启动后「唤醒与回声」会显示当前生效的选项。固件只启用所选的一个模型。更换唤醒词时，密码和 API Key 字段留空即可。
 
-唤醒后会轮换播放四条简短的本地应答。播报途中直接说问题或指令即可插话，也可以说当前唤醒词或点网页「停止语音」。小车在本地暂停扬声器并确认还有人声，确认后开始收音，留存开头的音频。插话开关和门限位于「Wi-Fi、DeepSeek 与参数」。后台会显示最近一次播报结果。
+唤醒后会轮换播放四条简短的本地应答。播报途中直接说问题或指令即可插话，也可以说当前唤醒词或点网页「停止语音」。检测到超过回声和当前播报电平的候选人声后，小车会短暂暂停扬声器，确认仍有人说话才进入收音，并保留开头的音频。插话开关和门限位于「Wi-Fi、DeepSeek 与参数」。后台会显示最近一次播报结果。
 
 唤醒应答为「在呢」「我在呀」「我听着呢」「你好呀」。四条唤醒应答和九条本地指令应答均用 Kokoro v1.1-zh 的 `zf_001` 音色离线合成，保存为 `main/cues/` 下的 16 kHz、16 bit 单声道 PCM，编译时直接嵌入固件。 [Kokoro 模型与许可](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh)
 
@@ -152,6 +157,7 @@ DeepSeek ASR 接收完整 WAV 后返回一次转写。普通对话把 Flash SSE 
 | --- | --- |
 | `main/audio.c`、`main/acoustics.c`、`main/wake_words.c` | I²S、回声消除、唤醒、DOA 和音频播放 |
 | `main/cloud.c`、`main/audio_wire.c` | DeepSeek HTTPS、SSE、WebSocket、WAV 和流式 PCM |
+| `main/local_tts.c`、`main/tts_text.c` | 乐鑫本地合成、增量中文分段 |
 | `main/harness.c`、`main/intent.c` | 对话上下文、NVS 记忆和动作意图 |
 | `main/motion.c`、`main/nav.c`、`main/grid.c` | 四轮控制、导航和地图规划 |
 | `main/network.c`、`main/wifi_order.c`、`main/console.html` | 配网、Wi-Fi 按序连接、网页状态与操作 |
@@ -159,7 +165,7 @@ DeepSeek ASR 接收完整 WAV 后返回一次转写。普通对话把 Flash SSE 
 
 ```bash
 cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -I main tests/core.c \
-  main/grid.c main/intent.c main/audio_wire.c main/wake_words.c main/acoustics.c main/wifi_order.c \
+  main/grid.c main/intent.c main/audio_wire.c main/wake_words.c main/acoustics.c main/wifi_order.c main/tts_text.c \
   -lm -o /tmp/rover-core-tests
 /tmp/rover-core-tests
 ```

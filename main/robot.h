@@ -32,11 +32,12 @@ typedef struct {
     uint32_t wake_choice;
     char ap_password[64];
     wifi_profiles_t wifi_profiles;
+    uint32_t tts_local;  // Appended to preserve the NVS v4 prefix.
 } robot_config_t;
 
 typedef struct {
     int cm;
-    bool valid, blocked, armed, moving;
+    bool valid, blocked, armed, moving, output_fault;
     uint32_t measurement, ticket;
     int echo_us, sample_age_ms, wheel, pwm, duration_ms;
     motion_result_t result;
@@ -86,6 +87,7 @@ audio_status_t audio_status(void);
 void audio_set_volume(int volume);
 int audio_volume(void);
 bool audio_begin_play(uint32_t id, bool isolated);
+bool audio_begin_local_play(uint32_t id);
 bool audio_push_play(uint32_t id, const void *data, size_t size);
 void audio_end_play(uint32_t id);
 void audio_interrupt(void);

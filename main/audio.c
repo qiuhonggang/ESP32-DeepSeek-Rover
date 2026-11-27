@@ -18,6 +18,7 @@
 
 #define PLAY_CAPACITY 16384
 #define PLAY_START_SAMPLES (SAMPLE_RATE * 240 / 1000)
+#define LOCAL_PLAY_START_SAMPLES (SAMPLE_RATE * 120 / 1000)
 #define PLAY_REFILL_SAMPLES (SAMPLE_RATE * 400 / 1000)
 #define PREROLL 9
 #define BARGE_PREROLL_LEAD_MS 560
@@ -61,7 +62,7 @@ static dialog_window_t dialog_window;
 static unsigned reset_capture;
 static struct {
     int16_t pcm[PLAY_CAPACITY];
-    size_t read, length;
+    size_t read, length, start_samples;
     uint32_t id;
     int64_t last_rx, drain_after;
     unsigned tone_sample;
@@ -159,7 +160,6 @@ static uint32_t next_turn_locked(void)
 
 uint32_t audio_begin_debug_turn(void)
 {
-    if (!network_ready()) return 0;
     taskENTER_CRITICAL(&state_lock);
     uint32_t id = 0;
     if (initialized && !telemetry.listening && !force_listen && !play.active) {
@@ -218,7 +218,7 @@ bool audio_turn_is_current(uint32_t id)
     return current;
 }
 
-bool audio_begin_play(uint32_t id, bool isolated)
+static bool begin_play(uint32_t id, bool isolated, size_t start_samples)
 {
     taskENTER_CRITICAL(&state_lock);
     bool accepted = initialized && !telemetry.listening && !play.active &&
@@ -226,6 +226,7 @@ bool audio_begin_play(uint32_t id, bool isolated)
     if (accepted) {
         play.id = id;
         play.read = play.length = 0;
+        play.start_samples = start_samples;
         play.tone_sample = 0;
         play.last_rx = esp_timer_get_time();
         play.drain_after = 0;
@@ -237,6 +238,16 @@ bool audio_begin_play(uint32_t id, bool isolated)
     }
     taskEXIT_CRITICAL(&state_lock);
     return accepted;
+}
+
+bool audio_begin_play(uint32_t id, bool isolated)
+{
+    return begin_play(id, isolated, PLAY_START_SAMPLES);
+}
+
+bool audio_begin_local_play(uint32_t id)
+{
+    return begin_play(id, false, LOCAL_PLAY_START_SAMPLES);
 }
 
 bool audio_test_tone(void)
@@ -365,7 +376,7 @@ static uint32_t fill_output(int64_t now, uint32_t pause_id, uint32_t *playback_i
             play.buffering = true;
             ++telemetry.playback_underruns;
         }
-        size_t target = play.started ? PLAY_REFILL_SAMPLES : PLAY_START_SAMPLES;
+        size_t target = play.started ? PLAY_REFILL_SAMPLES : play.start_samples;
         if (play.ended || play.length >= target) play.buffering = false;
         if (play.id == TEST_TONE_ID && play.tone_sample < 8000) {
             tone_active = true;
@@ -648,15 +659,14 @@ static void audio_task(void *unused)
         // clean callback can dereference a null queue in the WakeNet9 build.
         int threshold = robot_config.barge_rms;
         int weaker_mic = left < right ? left : right;
-        // The echo often dominates just one mic. Use both channels as onset
-        // evidence, then require a shared acoustic signal once TX goes quiet.
-        int detection_rms = !near_check && weaker_mic * 2 > level ? weaker_mic * 2 : level;
+        // Use AEC output for onset while the speaker plays. Raw stereo helps
+        // confirm a voice once the transmit reference is quiet.
         bool barge_speech = speech_like;
         if (near_check && barge_speech) {
             barge_speech = weaker_mic >= threshold / 2 &&
                 estimate_direction(mic_l, mic_r, frame, robot_config.mic_spacing_mm) != DIR_UNKNOWN;
         }
-        bool voice_barge = can_barge && barge_in_step(&barge, detection_rms, barge_speech,
+        bool voice_barge = can_barge && barge_in_step(&barge, level, barge_speech,
                                                       threshold, block_ms);
         if (can_barge && speech_like && level >= threshold + reference_rms / 2) {
             barge_voice_at = now;

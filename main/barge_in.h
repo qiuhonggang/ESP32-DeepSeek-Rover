@@ -11,12 +11,15 @@ enum {
 };
 
 typedef struct {
-    int echo_rms, started_ms, candidate_ms, candidate_peak;
+    int echo_rms, playback_rms, started_ms, candidate_ms, candidate_peak;
     int silence_ms, render_quiet_ms, confirmed_ms, retry_ms;
 } barge_in_t;
 
 static inline void barge_in_reference(barge_in_t *state, int rms, int block_ms)
 {
+    // Retain recent render peaks across quiet gaps and a brief echo tail.
+    int decay = state->playback_rms * 3 / 4;
+    state->playback_rms = rms > decay ? rms : decay;
     state->render_quiet_ms = state->silence_ms && rms < 12 ? state->render_quiet_ms + block_ms : 0;
 }
 
@@ -43,8 +46,9 @@ static inline bool barge_in_step(barge_in_t *state, int rms, bool speech, int th
     // Learn residual playback energy between speech candidates. A transient
     // alone must never end playback. Confirm it with the speaker paused.
     int echo_margin = state->echo_rms / 2 + threshold / 8;
+    int onset_floor = threshold + 2 * state->playback_rms;
     bool candidate = state->started_ms >= BARGE_ECHO_LEARN_MS && state->retry_ms <= 0 &&
-                     speech && rms >= threshold && rms >= state->echo_rms + echo_margin;
+                     speech && rms >= onset_floor && rms >= state->echo_rms + echo_margin;
     if (candidate) {
         state->candidate_ms += block_ms;
         if (rms > state->candidate_peak) state->candidate_peak = rms;

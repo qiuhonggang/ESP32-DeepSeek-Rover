@@ -227,7 +227,8 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
         <label>小车配网热点密码<input name="ap_password" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="留空保留现有密码"></label>
         <label>DeepSeek API 密钥<input name="api_key" type="password" maxlength="160" autocomplete="new-password"></label>
         <label>本地唤醒词<select name="wake_choice"></select></label>
-        <label>TTS 音色<select name="voice"><option value="stella">海星 · 女声</option><option value="tide">暗潮 · 男声</option></select></label>
+        <label>语音合成<select name="tts_engine"><option value="deepseek">DeepSeek（云端）</option><option value="local">乐鑫小乐（本地中文）</option></select></label>
+        <label>DeepSeek 音色<select name="voice"><option value="stella">海星 · 女声</option><option value="tide">暗潮 · 男声</option></select></label>
       </div>
       <label>对话资料和偏好<textarea name="profile" maxlength="100" rows="2" placeholder="例如 请用简短的中文回答"></textarea></label>
       <div class="row">
@@ -288,12 +289,13 @@ const navLabels = {origin_required:'待校准起点',origin_set:'起点已对齐
   exploration_done:'可到达区域扫描结束',arrived:'已到达估计目标格',step_limit:'达到本轮步数上限',
   locked:'电机已锁定',motion_timeout:'动作超时',motion_aborted:'动作中断',turn_blocked:'转向被拦截',
   motion_refused:'前进被拦截',navigation_timeout:'达到本轮时限'};
-const cloudLabels = {idle:'就绪',listening:'本地录音',asr:'DeepSeek 识别',flash:'Flash 生成',tts:'DeepSeek 合成',speaking:'播报中',
+const cloudLabels = {idle:'就绪',listening:'本地录音',asr:'DeepSeek 识别',flash:'Flash 生成',tts:'语音合成',speaking:'播报中',
   asr_done:'语音识别完成',flash_done:'Flash 文字测试完成',tts_done:'播报测试完成',
   interrupted:'已打断',audio_abort:'录音已取消',asr_error:'识别失败',flash_error:'Flash 失败',tts_error:'合成失败'};
 const cloudActive = new Set(['listening','asr','flash','tts','speaking']);
 const voiceCommands = new Set(['listen','tone','wake_feedback','stop_audio','debug_asr','debug_chat','debug_tts','debug_stream','volume']);
-const cloudTests = '[data-command=debug_asr],[data-command=debug_chat],[data-command=debug_tts],[data-command=debug_stream]';
+const cloudTests = '[data-command=debug_asr],[data-command=debug_chat],[data-command=debug_stream]';
+const ttsPaths = {deepseek_ws:'DeepSeek WebSocket',deepseek_http:'DeepSeek HTTP',local:'乐鑫本地合成'};
 const wheels = ['左前','右前','左后','右后'];
 const actions = {move_forward:'前进',move_backward:'后退',turn_left:'左转',turn_right:'右转',happy_wiggle:'摇摆'};
 const motorResults = {idle:'空闲',running:'执行中',done:'已完成',aborted:'已中断'};
@@ -429,7 +431,9 @@ function renderSonar(s) {
 function renderMotor(s) {
   const motor = s.motor;
   show('motion', s.armed ? (s.moving ? '运行中 · ' + (actions[s.action] || s.action) : '已启用') : '已锁定');
-  if (motor.ticket) {
+  if (motor.output_fault) {
+    show('motor_last', 'PWM 输出失败，电机已锁定。重启后可重新启用');
+  } else if (motor.ticket) {
     const target = wheels[motor.wheel] || '整车';
     const action = motor.wheel >= 0 ? (motor.action === 'move_backward' ? '反向' : '正向') : actions[motor.action];
     show('motor_last', '#' + motor.ticket + ' · ' + target + action + ' · PWM ' + motor.pwm + ' · ' +
@@ -439,7 +443,7 @@ function renderMotor(s) {
   byId('test_direction').dataset.forwardBlocked = String(s.blocked || !s.valid);
   byId('test_direction').dataset.motorAvailable = String(available);
   updateWheelButtons();
-  buttons('[data-command=arm]', s.armed || motor.result === 'running' || !s.valid || s.blocked);
+  buttons('[data-command=arm]', motor.output_fault || s.armed || motor.result === 'running' || !s.valid || s.blocked);
   buttons('[data-drive],[data-cal]', !available);
   if (available && (s.blocked || !s.valid)) buttons('[data-drive][data-command=move_forward],[data-cal=move_forward]', true);
 }
@@ -488,6 +492,7 @@ function render(s) {
       hardware.front_cm == null ? '前方无读数' : '车头前方 ' + hardware.front_cm + ' cm',
       '语音速度档 ' + paces[cloud.voice_pace]].join(' · ') : '—');
   const stages = [
+    ttsPaths[cloud.tts_path],
     cloud.first_play_ms && (cloud.asr_ms ? '说完→I²S ' : '开始→I²S ') + cloud.first_play_ms + ' ms',
     cloud.asr_ms && 'ASR ' + cloud.asr_ms + ' ms',
     cloud.flash_first_ms && 'Flash 首段 ' + cloud.flash_first_ms + ' ms',
@@ -500,11 +505,12 @@ function render(s) {
   show('token_usage', cloud.prompt_tokens >= 0 && cloud.completion_tokens >= 0 ?
     '输入 ' + cloud.prompt_tokens + ' · 输出 ' + cloud.completion_tokens +
     (cloud.cached_tokens >= 0 ? ' · 缓存命中 ' + cloud.cached_tokens : '') : '—');
-  if (!s.key_set) show('cloud', '待填写 API 密钥');
-  else if (!s.wifi) show('cloud', '待连接 Wi-Fi');
-  else if (!s.clock) show('cloud', '正在同步时钟');
+  const localStatus = cloud.tts_path === 'local' && ['tts','speaking','tts_done','tts_error','interrupted'].includes(cloud.phase);
+  if (!localStatus && !s.key_set) show('cloud', '待填写 API 密钥');
+  else if (!localStatus && !s.wifi) show('cloud', '待连接 Wi-Fi');
+  else if (!localStatus && !s.clock) show('cloud', '正在同步时钟');
   else show('cloud', (cloudLabels[cloud.phase] || cloud.phase) +
-       (cloud.http ? ' · HTTP ' + cloud.http : (cloud.phase.endsWith('_error') ? ' · 未收到 HTTP 响应' : '')));
+       (cloud.http ? ' · HTTP ' + cloud.http : (!localStatus && cloud.phase.endsWith('_error') ? ' · 未收到 HTTP 响应' : '')));
   renderSonar(s);
   renderMotor(s);
   show('mic_left', s.left_rms + ' RMS');
@@ -549,6 +555,7 @@ function render(s) {
   const voiceBusy = cloudActive.has(cloud.phase) || cloud.debug_busy || s.listening || s.speaking;
   buttons('[data-command=listen]', !cloud.ready || s.listening);
   buttons(cloudTests, !cloud.ready || voiceBusy);
+  buttons('[data-command=debug_tts]', !(cloud.ready || cloud.tts_local) || voiceBusy);
   buttons('[data-command=tone],[data-command=wake_feedback]', voiceBusy);
   document.querySelectorAll('[data-command=explore],[data-command=home],[data-command=goto_name],#route')
     .forEach(b => b.disabled = !s.armed || !s.nav.pose || s.nav.mode !== 'idle');
@@ -569,10 +576,16 @@ async function refresh() {
   }
   finally { pending = false; }
 }
+function updateVoiceField() {
+  field('voice').disabled = field('tts_engine').value === 'local';
+}
+field('tts_engine').addEventListener('change', updateVoiceField);
 async function unlock() {
   try {
     const cfg = await request('/api/config');
     for (const k of [...numeric,'voice','profile']) field(k).value = cfg[k];
+    field('tts_engine').value = cfg.tts_engine || 'deepseek';
+    updateVoiceField();
     wifiLimit = cfg.wifi_limit;
     wifiSaved.clear();
     wifiList.replaceChildren();
@@ -699,7 +712,8 @@ form.addEventListener('submit', async e => {
   e.preventDefault();
   const wifi_networks = wifiPayload();
   if (!wifi_networks) return;
-  const payload = {wifi_networks, voice:field('voice').value, wake_choice:Number(field('wake_choice').value),
+  const payload = {wifi_networks, tts_engine:field('tts_engine').value, voice:field('voice').value,
+    wake_choice:Number(field('wake_choice').value),
     profile:field('profile').value,
     history:field('history').checked, barge:field('barge').checked,
     polarity:[0,1,2,3].map(i => Number(field('polarity'+i).value))};

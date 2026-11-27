@@ -58,7 +58,7 @@ static esp_err_t save_config(const robot_config_t *config)
     nvs_handle_t nvs;
     esp_err_t result = nvs_open(STORE, NVS_READWRITE, &nvs);
     if (result != ESP_OK) return result;
-    result = nvs_set_blob(nvs, "config-v4", config, sizeof(*config));
+    result = nvs_set_blob(nvs, "config-v5", config, sizeof(*config));
     if (result == ESP_OK) result = nvs_commit(nvs);
     nvs_close(nvs);
     return result;
@@ -68,11 +68,12 @@ void network_load_config(void)
 {
     config_lock = xSemaphoreCreateMutex();
     assert(config_lock);
-    bool migrated = false;
+    bool migrated = false, legacy_wifi = false;
     nvs_handle_t nvs;
     if (nvs_open(STORE, NVS_READONLY, &nvs) == ESP_OK) {
         const struct { const char *key; size_t bytes; } versions[] = {
-            {"config-v4", sizeof(robot_config_t)},
+            {"config-v5", sizeof(robot_config_t)},
+            {"config-v4", offsetof(robot_config_t, tts_local)},
             {"config-v3", offsetof(robot_config_t, wifi_profiles)},
             {"config-v2", offsetof(robot_config_t, ap_password)},
             {"config-v1", offsetof(robot_config_t, wake_choice)},
@@ -84,16 +85,18 @@ void network_load_config(void)
                 length != versions[i].bytes || saved.wifi_profiles.count > WIFI_PROFILE_LIMIT) continue;
             robot_config = saved;
             migrated = i > 0;
+            legacy_wifi = i > 1;
             break;
         }
         nvs_close(nvs);
     }
-    if (migrated) {
+    if (legacy_wifi) {
         wifi_profiles_add(&robot_config.wifi_profiles, NULL, robot_config.legacy_ssid,
                           robot_config.legacy_password);
         memset(robot_config.legacy_ssid, 0, sizeof(robot_config.legacy_ssid));
         memset(robot_config.legacy_password, 0, sizeof(robot_config.legacy_password));
     }
+    robot_config.tts_local = robot_config.tts_local == 1;
     if (robot_config.wake_choice >= wake_option_count) robot_config.wake_choice = 0;
     if (!robot_config.console_key[0]) {
         uint32_t entropy[3];
@@ -349,6 +352,7 @@ static esp_err_t get_status(httpd_req_t *req)
         cJSON *motor = cJSON_AddObjectToObject(json, "motor");
         const char *results[] = {"idle", "running", "done", "aborted"};
         cJSON_AddStringToObject(motor, "result", results[chassis.result]);
+        cJSON_AddBoolToObject(motor, "output_fault", chassis.output_fault);
         cJSON_AddNumberToObject(motor, "ticket", chassis.ticket);
         cJSON_AddStringToObject(motor, "action", action_name(chassis.last_action));
         cJSON_AddNumberToObject(motor, "wheel", chassis.wheel);
@@ -399,6 +403,7 @@ static esp_err_t get_config(httpd_req_t *req)
             if (!cJSON_AddItemToArray(networks, item)) cJSON_Delete(item);
         }
         cJSON_AddStringToObject(json, "voice", robot_config.voice);
+        cJSON_AddStringToObject(json, "tts_engine", robot_config.tts_local ? "local" : "deepseek");
         cJSON_AddNumberToObject(json, "wake_choice", robot_config.wake_choice);
         cJSON *words = cJSON_AddArrayToObject(json, "wake_options");
         for (unsigned i = 0; i < wake_option_count; ++i) {
@@ -484,6 +489,11 @@ static bool apply_config(cJSON *json, robot_config_t *next)
     if (wake_choice < 0 || (unsigned)wake_choice >= wake_option_count) return false;
     next->wake_choice = (uint32_t)wake_choice;
     if (!token_valid(next->api_key) || (strcmp(next->voice, "stella") && strcmp(next->voice, "tide"))) return false;
+    if (cJSON_HasObjectItem(json, "tts_engine")) {
+        const char *engine = get_text(json, "tts_engine");
+        if (!engine || (strcmp(engine, "local") && strcmp(engine, "deepseek"))) return false;
+        next->tts_local = !strcmp(engine, "local");
+    }
     if (cJSON_HasObjectItem(json, "history")) next->history = get_bool(json, "history");
     if (cJSON_HasObjectItem(json, "barge")) next->barge = get_bool(json, "barge");
     for (int i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
