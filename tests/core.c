@@ -64,6 +64,45 @@ static void test_intent(void)
     assert(intent_from_transcript("他说左转", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("左转，然后前进", NULL).type == INTENT_CHAT);
     assert(intent_from_transcript("\"左转\"", NULL).type == INTENT_CHAT);
+    const struct { const char *text; action_t action; voice_pace_t pace; } requests[] = {
+        {"往前", FORWARD, PACE_CURRENT}, {"往后！", BACK, PACE_CURRENT},
+        {"你好小智，可以再往前挪一点儿吗？", FORWARD, PACE_CURRENT},
+        {"小车，帮我往后退一小步吧。", BACK, PACE_CURRENT},
+        {"你能不能朝左边转一下？", LEFT, PACE_CURRENT},
+        {"麻烦你慢慢往后倒。", BACK, PACE_SLOW},
+        {"请朝右边转快一点。", RIGHT, PACE_FAST},
+    };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); ++i) {
+        intent_t move = intent_from_transcript(requests[i].text, &wake_options[2]);
+        assert(move.type == INTENT_DRIVE && move.action == requests[i].action && move.pace == requests[i].pace);
+    }
+    const char *const conversational[] = {
+        "往前还是往后？", "不要往后退一点", "往前走会撞到我吗？", "可以告诉我怎么往前走吗？",
+        "他说可以往前走吗？", "再往前，然后停下", "往前走十米", "你能往前走多远？",
+    };
+    for (size_t i = 0; i < sizeof(conversational) / sizeof(conversational[0]); ++i) {
+        assert(intent_from_transcript(conversational[i], NULL).type == INTENT_CHAT);
+    }
+    const intent_t unparsed = {.type = INTENT_CHAT};
+    assert(intent_model_candidate("网前", unparsed));
+    assert(intent_from_model("网前", unparsed, "move_forward", NULL).action == FORWARD);
+    assert(intent_from_model("能不能再往后挪挪", unparsed, "move_backward", "slow").pace == PACE_SLOW);
+    assert(intent_from_model("现在把车停住", unparsed, "stop", NULL).type == INTENT_STOP);
+    assert(intent_from_model("你开过来呀", unparsed, "approach", NULL).type == INTENT_APPROACH);
+    assert(intent_from_model("开到我这边", intent_from_transcript("开到我这边", NULL),
+                            "approach", NULL).type == INTENT_APPROACH);
+    assert(intent_from_model("后退", intent_from_transcript("后退", NULL), "move_forward", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("他说过来", unparsed, "approach", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("你不要往前再问能不能", unparsed, "move_forward", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("先往前，然后右转", unparsed, "move_forward", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("往前会不会撞到桌子", unparsed, "move_forward", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("前面有什么", unparsed, "approach", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("去客厅", unparsed, "navigate", NULL).type == INTENT_CHAT);
+    assert(intent_from_model("往后", unparsed, "gpio_write", NULL).type == INTENT_CHAT);
+    assert(intent_approach_direction("过来", DIR_CENTER) == DIR_UNKNOWN);
+    assert(intent_approach_direction("我在车头前面，过来", DIR_CENTER) == DIR_CENTER);
+    assert(intent_approach_direction("我在车头前面，过来", DIR_UNKNOWN) == DIR_UNKNOWN);
+    assert(intent_approach_direction("过来", DIR_LEFT) == DIR_LEFT);
     intent_t quieter = intent_from_transcript("你好小智，小声一点。", &wake_options[2]);
     assert(quieter.type == INTENT_VOLUME_CHANGE && quieter.volume == -8);
     intent_t volume = intent_from_transcript("把音量调到百分之三十五。", NULL);
@@ -231,7 +270,8 @@ static void test_barge_in(void)
         assert(!barge.silence_ms);
     }
     // Near-end speech can still start a confirmation over audible playback.
-    for (int i = 0; i < 2; ++i) {
+    for (int elapsed = 0; elapsed < BARGE_VOICE_START_MS; elapsed += 32) {
+        assert(!barge.silence_ms);
         barge_in_reference(&barge, 1400, 32);
         assert(!barge_in_step(&barge, 4600, true, 530, 32));
     }
@@ -241,11 +281,22 @@ static void test_barge_in(void)
         assert(!barge_in_step(&barge, 460, true, 530, 32));
         assert(!barge.silence_ms);
     }
-    // The speaker alone can cause a transient above threshold. Once muted,
-    // tail and a single loud tap must not cancel the pending PCM.
-    assert(!barge_in_step(&barge, 1300, true, 530, 32));
-    assert(!barge_in_step(&barge, 1300, true, 530, 32) && barge.silence_ms);
-    for (int i = 0; i < 6; ++i) {
+    // Brief residual echo must not pause playback.
+    for (int i = 0; i < 2; ++i) {
+        assert(!barge_in_step(&barge, 1300, true, 530, 32) && !barge.silence_ms);
+    }
+    for (int elapsed = 0; elapsed <= BARGE_VOICE_GAPS_MS; elapsed += 32) {
+        assert(!barge_in_step(&barge, 460, true, 530, 32) && !barge.silence_ms);
+    }
+    assert(!barge.candidate_ms);
+
+    // A sustained candidate can pause for confirmation. Echo and a single
+    // tap cannot cancel queued PCM, and a quiet mic resumes it early.
+    for (int elapsed = 0; elapsed < BARGE_VOICE_START_MS; elapsed += 32) {
+        assert(!barge_in_step(&barge, 1300, true, 530, 32));
+    }
+    assert(barge.silence_ms);
+    for (int i = 0; i < 4; ++i) {
         barge_in_reference(&barge, 600, 32);
         assert(!barge_in_near_mic(&barge));
         assert(!barge_in_step(&barge, 1200, true, 530, 32));
@@ -255,21 +306,27 @@ static void test_barge_in(void)
         assert(!barge_in_step(&barge, 1200, true, 530, 32));
     }
     assert(!barge_in_step(&barge, 950, true, 530, 32));
-    while (barge.silence_ms) assert(!barge_in_step(&barge, 70, false, 530, 32));
+    assert(!barge_in_step(&barge, 70, false, 530, 32) && barge.silence_ms);
+    assert(!barge_in_step(&barge, 70, false, 530, 32) && !barge.silence_ms);
     assert(barge.retry_ms > 0);
 
-    // Speech continues after the echo tail and triggers a new recording.
+    // A weak syllable between louder ones does not reset the onset. Once the
+    // echo has drained, speech below the onset level can confirm recording.
     for (int i = 0; i < 24; ++i) assert(!barge_in_step(&barge, 480, true, 530, 32));
     assert(!barge_in_step(&barge, 1400, true, 530, 32));
-    assert(!barge_in_step(&barge, 1400, true, 530, 32) && barge.silence_ms);
+    assert(!barge_in_step(&barge, 450, false, 530, 32));
+    for (int elapsed = 32; elapsed < BARGE_VOICE_START_MS; elapsed += 32) {
+        assert(!barge_in_step(&barge, 1400, true, 530, 32));
+    }
+    assert(barge.silence_ms);
     while (!barge_in_near_mic(&barge)) {
         barge_in_reference(&barge, 0, 32);
         assert(!barge_in_step(&barge, 1100, false, 530, 32));
     }
-    assert(!barge_in_step(&barge, 950, true, 530, 32));
-    assert(!barge_in_step(&barge, 840, true, 530, 32));
-    assert(barge_in_step(&barge, 840, true, 530, 32));
-    puts("PASS speech interruption, echo-only recovery and impulse rejection");
+    assert(!barge_in_step(&barge, 450, true, 530, 32));
+    assert(!barge_in_step(&barge, 420, true, 530, 32));
+    assert(barge_in_step(&barge, 400, true, 530, 32));
+    puts("PASS speech interruption, echo-only recovery, syllable gaps and quieter confirmation");
 }
 
 static void test_tts_segments(void)

@@ -32,7 +32,7 @@
 #define BOUNDARY "ESP32Rover-a77b2f2d16b64050"
 static const char *TAG = "cloud";
 
-typedef enum { JOB_VOICE, JOB_ASR_ONLY, JOB_TEXT_CHAT, JOB_TEXT_TTS, JOB_TEXT_STREAM } job_type_t;
+typedef enum { JOB_VOICE, JOB_ASR_ONLY, JOB_TEXT_CHAT, JOB_TEXT_TTS, JOB_TEXT_STREAM, JOB_TEXT_INTENT } job_type_t;
 typedef enum { TTS_NONE, TTS_DEEPSEEK_WS, TTS_DEEPSEEK_HTTP, TTS_LOCAL } tts_path_t;
 typedef struct {
     uint32_t id;
@@ -158,7 +158,8 @@ bool cloud_debug_text(const char *text, const char *command)
         return false;
     }
     *job = (utterance_t){.type = speak_only ? JOB_TEXT_TTS :
-        !strcmp(command, "debug_stream") ? JOB_TEXT_STREAM : JOB_TEXT_CHAT};
+        !strcmp(command, "debug_stream") ? JOB_TEXT_STREAM :
+        !strcmp(command, "debug_intent") ? JOB_TEXT_INTENT : JOB_TEXT_CHAT};
     memcpy(job->data, text, bytes + 1);
     if (uxQueueSpacesAvailable(jobs)) {
         job->id = audio_begin_debug_turn();
@@ -351,12 +352,12 @@ static bool transcribe(const utterance_t *job, char *text, size_t size)
     return text[0] != 0;
 }
 
-static bool chat(const char *text, const char *expected, uint32_t id, bool include_context,
+static bool chat(const char *text, bool action_only, uint32_t id,
                  const hardware_context_t *hardware, char *reply, size_t reply_size,
-                 char *action, size_t action_size)
+                 char *action, size_t action_size, char *pace, size_t pace_size)
 {
     uint32_t flash_at = esp_timer_get_time() / 1000;
-    char *payload = harness_request(text, expected, include_context, false, hardware);
+    char *payload = harness_request(text, action_only, false, false, hardware);
     if (!payload) return false;
     part_t part = {payload, strlen(payload)};
     post_t post = open_post(FLASH_URL, "application/json", &part, 1, id);
@@ -368,11 +369,25 @@ static bool chat(const char *text, const char *expected, uint32_t id, bool inclu
     cJSON *message = cJSON_GetObjectItemCaseSensitive(item, "message");
     const char *content = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(message, "content"));
     cJSON *result = content ? cJSON_ParseWithOpts(content, NULL, true) : NULL;
-    text_copy(reply, reply_size, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "reply")));
-    text_copy(action, action_size, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "action")));
+    bool valid = false;
+    if (action_only && cJSON_IsObject(result)) {
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "action"));
+        cJSON *pace_node = cJSON_GetObjectItemCaseSensitive(result, "pace");
+        const char *speed = cJSON_GetStringValue(pace_node);
+        valid = name && name[0] && strlen(name) < action_size &&
+                cJSON_GetArraySize(result) == (pace_node ? 2 : 1) &&
+                (!pace_node || (speed && (!strcmp(speed, "slow") || !strcmp(speed, "normal") ||
+                                          !strcmp(speed, "fast"))));
+        if (valid) {
+            text_copy(action, action_size, name);
+            text_copy(pace, pace_size, speed);
+        }
+    } else if (!action_only) {
+        text_copy(reply, reply_size, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "reply")));
+        valid = reply[0] != 0;
+    }
     cJSON_Delete(result);
     cJSON_Delete(body);
-    bool valid = strcmp(expected, "none") ? action[0] != 0 : reply[0] != 0;
     if (valid) atomic_store(&flash_complete_ms, elapsed_ms(flash_at));
     if (!valid && current(id)) status("flash_error", post.http_status, NULL, NULL);
     return valid;
@@ -631,20 +646,25 @@ static bool tts_stream_pump(tts_stream_t *stream, uint32_t id, bool *started,
     return !atomic_load(&stream->failed) && atomic_load(&playback_failed) != id && current(id);
 }
 
-static bool flush_stream_text(tts_stream_t *stream, const char *reply, size_t *sent, size_t length,
+static bool flush_stream_text(tts_stream_t *stream, char *reply, size_t *sent, size_t length,
                               bool final)
 {
     if (atomic_load(&stream->failed) || !atomic_load(&stream->connected)) return false;
-    if (*sent < length) {
-        const char *pending = reply + *sent;
-        bool boundary = strpbrk(pending, ".?!\n") || strstr(pending, "。") ||
-                        strstr(pending, "！") || strstr(pending, "？") || strstr(pending, "，");
-        if (final || boundary || length - *sent >= 24) {
-            if (!tts_stream_send(stream, pending)) return false;
-            *sent = length;
-        }
+    size_t ready = *sent;
+    while (ready < length) {
+        size_t segment = tts_text_segment(reply + ready, length - ready, final);
+        if (!segment) break;
+        ready += segment;
     }
-    return !final || tts_stream_send(stream, NULL);
+    if (ready > *sent) {
+        char next = reply[ready];
+        reply[ready] = 0;
+        bool sent_now = tts_stream_send(stream, reply + *sent);
+        reply[ready] = next;
+        if (!sent_now) return false;
+        *sent = ready;
+    }
+    return !final || (*sent == length && tts_stream_send(stream, NULL));
 }
 
 static bool flash_stream_event(char *line, char *reply, size_t capacity, size_t *length,
@@ -686,7 +706,7 @@ static bool stream_chat(const char *text, uint32_t id, bool include_context,
     atomic_store(&tts_first_ms, 0);
     atomic_store(&playback_done, 0);
     atomic_store(&playback_failed, 0);
-    char *request = harness_request(text, "none", include_context, true, hardware);
+    char *request = harness_request(text, false, include_context, true, hardware);
     if (!request) return false;
     bool local = robot_config.tts_local;
     local_tts_t local_stream = {0};
@@ -811,6 +831,7 @@ static const char *intent_name(intent_t intent)
         case INTENT_MARK: return "mark";
         case INTENT_REMEMBER: return "remember";
         case INTENT_FACE_SOUND: return "face_sound";
+        case INTENT_APPROACH: return "approach";
         case INTENT_VOLUME_SET:
         case INTENT_VOLUME_CHANGE:
         case INTENT_VOICE_PACE:
@@ -825,14 +846,15 @@ static const char *intent_name(intent_t intent)
 static int voice_pwm(voice_pace_t pace)
 {
     if (pace == PACE_CURRENT) pace = atomic_load(&voice_pace);
-    if (pace == PACE_SLOW) return 82;
-    if (pace == PACE_FAST) return 134;
-    return 107;
+    if (pace == PACE_SLOW) return 130;
+    if (pace == PACE_FAST) return 160;
+    return 145;
 }
 
 static const char *drive_block_reason(action_t action)
 {
     motion_status_t chassis = motion_status();
+    if (chassis.output_fault) return "轮子的驱动出了点问题，请大人帮我看看。";
     if (!chassis.armed) return "我的轮子还锁着呢，请大人先帮我开启电机。";
     if (action == FORWARD && chassis.blocked) {
         return chassis.valid ? "前面有东西挡着，我先停在这儿。" : "我还没量清前面有多远，先停一下。";
@@ -842,19 +864,40 @@ static const char *drive_block_reason(action_t action)
 
 static const char *try_drive(intent_t intent, uint32_t turn)
 {
-    if (!nav_cloud_motion(intent.action, voice_pwm(intent.pace), 275, turn)) {
-        const char *blocked = drive_block_reason(intent.action);
+    const char *blocked = drive_block_reason(intent.action);
+    if (blocked) return blocked;
+    uint32_t ticket = nav_cloud_motion(intent.action, voice_pwm(intent.pace), 240, turn);
+    if (!ticket) {
+        blocked = drive_block_reason(intent.action);
         return blocked ? blocked : "我先等等，等准备好了我们再试一次。";
     }
-    switch (intent.action) {
-        case FORWARD: return "好，我往前挪一点。";
-        case BACK: return "我往后退一小步。";
-        case LEFT: return "我朝左边转一点。";
-        case RIGHT: return "好，我朝右边转一点。";
-        case WIGGLE: return "看，我来扭一下。";
-        case STOP: return NULL;
+    const int64_t deadline = esp_timer_get_time() + 600000;
+    while (current(turn) && esp_timer_get_time() < deadline) {
+        motion_status_t chassis = motion_status();
+        if (chassis.ticket != ticket) break;
+        if (chassis.result == MOTION_DONE) {
+            switch (intent.action) {
+                case FORWARD: return "好，往前一点点。";
+                case BACK: return "好，往后退一小步。";
+                case LEFT: return "好，朝左边转一点。";
+                case RIGHT: return "好，朝右边转一点。";
+                case WIGGLE: return "好，扭一下。";
+                case STOP: break;
+            }
+        }
+        if (chassis.result == MOTION_ABORTED) {
+            if (chassis.stop_reason && !strcmp(chassis.stop_reason, "obstacle")) {
+                return "前面有东西，我先停下啦。";
+            }
+            if (chassis.stop_reason && (!strcmp(chassis.stop_reason, "echo") ||
+                !strcmp(chassis.stop_reason, "echo_range") || !strcmp(chassis.stop_reason, "stale"))) {
+                return "我没量清前面有多远，先停下啦。";
+            }
+            return "轮子刚才停下了，等一下再试吧。";
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    return NULL;
+    return "我还没确认轮子转好了，请大人帮我看看。";
 }
 
 typedef struct { const char *text; const uint8_t *start, *end; } local_clip_t;
@@ -896,8 +939,6 @@ static bool speak_clip(const local_clip_t *clip, uint32_t id)
 static const char *perform_local(intent_t intent, uint32_t id, const local_clip_t **clip)
 {
     switch (intent.type) {
-        case INTENT_DRIVE:
-            return drive_block_reason(intent.action);
         case INTENT_STOP:
             nav_stop(false);
             *clip = &stop_clip;
@@ -933,12 +974,29 @@ static const char *perform_local(intent_t intent, uint32_t id, const local_clip_
     return (*clip)->text;
 }
 
-static const char *perform(intent_t intent, direction_t direction, uint32_t turn)
+static const char *perform(intent_t intent, const char *text, direction_t direction, uint32_t turn)
 {
     bool accepted;
     switch (intent.type) {
         case INTENT_DRIVE:
             return try_drive(intent, turn);
+        case INTENT_APPROACH: {
+            const char *blocked = drive_block_reason(FORWARD);
+            if (blocked) return blocked;
+            direction = intent_approach_direction(text, direction);
+            if (direction == DIR_UNKNOWN) {
+                return "我还没听清你在哪边。站在车头前说：我在你前面，过来。";
+            }
+            action_t initial = direction == DIR_LEFT ? LEFT : direction == DIR_RIGHT ? RIGHT : FORWARD;
+            motion_status_t chassis = motion_status();
+            if (!chassis.valid) return "我没量到前面有多远，先在这儿等你。";
+            if (chassis.cm <= motion_approach_clearance_cm(initial)) {
+                return "前面离东西太近啦，我先待在这里。";
+            }
+            return nav_approach_for_turn(direction, voice_pwm(PACE_SLOW), turn)
+                ? "我朝你这边开一小段，前面有东西我会停。"
+                : "我现在还不能过去，等我停稳再叫我吧。";
+        }
         case INTENT_EXPLORE:
             return nav_explore_for_turn(turn) ? "好呀，我慢慢看看周围。" : "我还没准备好。请大人帮我准备一下吧。";
         case INTENT_GOTO:
@@ -973,7 +1031,7 @@ static void handle(utterance_t *job)
     uint32_t id = job->id;
     bool local_test = job->type == JOB_TEXT_TTS && robot_config.tts_local;
     if (!(local_test ? audio_turn_is_current(id) : current(id))) return;
-    char text[243] = {0}, reply[301] = {0}, action[32] = {0};
+    char text[243] = {0}, reply[301] = {0}, action[32] = {0}, pace[8] = {0};
     atomic_store(&timing_id, 0);
     atomic_store(&asr_ms, 0);
     atomic_store(&first_play_ms, 0);
@@ -1002,8 +1060,19 @@ static void handle(utterance_t *job)
         const char *prompt = (const char *)job->data;
         hardware_context_t hardware = snapshot_hardware(DIR_UNKNOWN);
         status("flash", 0, prompt, "");
-        if (chat(prompt, "none", id, false, &hardware, reply, sizeof(reply), action, sizeof(action)) && current(id)) {
+        if (chat(prompt, false, id, &hardware, reply, sizeof(reply), action, sizeof(action), pace, sizeof(pace)) && current(id)) {
             status("flash_done", 200, NULL, reply);
+        }
+        return;
+    }
+    if (job->type == JOB_TEXT_INTENT) {
+        const char *prompt = (const char *)job->data;
+        status("flash", 0, prompt, "");
+        if (chat(prompt, true, id, NULL, reply, sizeof(reply), action, sizeof(action), pace, sizeof(pace)) && current(id)) {
+            intent_t parsed = intent_from_transcript(prompt, audio_selected_wake());
+            intent_t checked = intent_from_model(prompt, parsed, action, pace);
+            snprintf(reply, sizeof(reply), "Flash 判定 %s · 固件校验 %s", action, intent_name(checked));
+            status("intent_done", 200, NULL, reply);
         }
         return;
     }
@@ -1026,9 +1095,27 @@ static void handle(utterance_t *job)
         status("asr_done", 200, text, "");
         return;
     }
-    intent_t intent = intent_from_transcript(text, audio_selected_wake());
+    intent_t parsed = intent_from_transcript(text, audio_selected_wake());
+    intent_t intent = parsed;
     const local_clip_t *clip = NULL;
-    const char *local = perform_local(intent, id, &clip);
+    const char *local = perform_local(parsed, id, &clip);
+    if (!local && intent_model_candidate(text, parsed)) {
+        status("flash", 0, text, "");
+        bool classified = chat(text, true, id, NULL, reply, sizeof(reply), action, sizeof(action), pace, sizeof(pace));
+        if (!current(id)) return;
+        if (!classified) {
+            local = "刚才没听明白。你可以再说一次。";
+        } else {
+            intent = intent_from_model(text, parsed, action, pace);
+            if (intent.type == INTENT_STOP) {
+                local = perform_local(intent, id, &clip);
+            } else if (intent.type != INTENT_CHAT) {
+                local = esp_timer_get_time() - job->captured_at > 12000000 ?
+                    "等得有点久，你再叫我一次吧。" : perform(intent, text, job->direction, id);
+            }
+        }
+    }
+    if (!current(id)) return;
     hardware_context_t hardware = snapshot_hardware(job->direction);
     if (local) {
         close_asr_connection();
@@ -1044,41 +1131,12 @@ static void handle(utterance_t *job)
         }
         return;
     }
-    if (intent.type == INTENT_CHAT) {
-        status("flash", 0, text, "");
-        if (stream_chat(text, id, true, &hardware, reply, sizeof(reply))) {
-            harness_add_turn(text, reply);
-            finish_dialog(id);
-        } else {
-            audio_end_dialog(id);
-        }
-        return;
-    }
-    const char *expected = intent_name(intent);
-    bool successful = true;
-    status("flash", 0, text, NULL);
-    if (!chat(text, expected, id, true, &hardware, reply, sizeof(reply), action, sizeof(action))) {
-        if (!current(id)) return;
-        successful = false;
-        text_copy(reply, sizeof(reply), "我听到啦。等一会儿，我们再聊吧。");
-    }
-    if (!current(id)) return;
-    if (successful) {
-        const char *outcome;
-        if (esp_timer_get_time() - job->captured_at > 12000000) {
-            outcome = "等得有点久。你可以再说一遍吗？";
-        } else if (strcmp(action, expected)) {
-            outcome = "我还没听明白。你可以慢慢再说一遍吗？";
-        } else {
-            outcome = perform(intent, job->direction, id);
-        }
-        if (outcome) text_copy(reply, sizeof(reply), outcome);
-    }
-    if (!current(id)) return;
-    status("tts", 0, text, reply);
-    if (speak(reply, id)) {
-        if (successful) harness_add_turn(text, reply);
+    status("flash", 0, text, "");
+    if (stream_chat(text, id, true, &hardware, reply, sizeof(reply))) {
+        harness_add_turn(text, reply);
         finish_dialog(id);
+    } else {
+        audio_end_dialog(id);
     }
 }
 

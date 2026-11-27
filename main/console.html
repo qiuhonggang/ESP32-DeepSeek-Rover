@@ -104,6 +104,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       <div class="row">
         <button data-command="debug_stream">测试流式对话和播报</button>
         <button data-command="debug_chat">只测 Flash 文字对话</button>
+        <button data-command="debug_intent">只测语音意图（不动电机）</button>
         <button data-command="debug_tts">只测 TTS 播报</button>
       </div>
     </section>
@@ -138,7 +139,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
         <dt>避障状态</dt><dd id="sonar_gate">—</dd>
         <dt>回波脉宽</dt><dd id="sonar_echo">—</dd>
         <dt>采样编号</dt><dd id="sonar_seq">—</dd>
-        <dt>急停距离</dt><dd id="sonar_limit">—</dd>
+        <dt>前向急停距离</dt><dd><span id="sonar_limit">—</span> <button id="edit_stop_cm" type="button">修改</button></dd>
       </dl>
       <div class="test-group">
         <h3>最近 12 次网页采样（新到旧）</h3>
@@ -157,12 +158,12 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
         <button data-command="emergency" class="danger">急停并锁定</button>
       </div>
       <div class="test-group">
-        <h3>单轮点动</h3>
-        <p class="small">先架空四轮。点一次只发一个短脉冲，电机仍受本地保护约束。</p>
+        <h3>点动参数</h3>
+        <p class="small">先架空四轮。单轮和整车按钮共用 PWM 和时长。</p>
         <div class="fields">
-          <label>点动方向<select id="test_direction"><option value="move_forward">正向</option><option value="move_backward">反向</option></select></label>
-          <label>点动 PWM<input id="test_pwm" type="number" min="65" max="180" value="105" required></label>
-          <label>时长（ms）<input id="test_ms" type="number" min="80" max="240" value="180" required></label>
+          <label>单轮方向<select id="test_direction"><option value="move_forward">正向</option><option value="move_backward">反向</option></select></label>
+          <label>点动 PWM<input id="test_pwm" type="number" min="65" max="180" value="145" required></label>
+          <label>时长（ms）<input id="test_ms" type="number" min="80" max="240" value="240" required></label>
         </div>
         <div class="row test-group">
           <button data-wheel="0" data-command="wheel_test">左前</button>
@@ -239,7 +240,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
       <details>
         <summary>测距、电机和声音</summary>
         <div class="fields">
-          <label>前向急停（cm）<input name="stop_cm" type="number" min="15" max="100" required></label>
+          <label>前向急停（cm）<input name="stop_cm" type="number" min="10" max="100" step="1" required></label>
           <label>最大 PWM<input name="speed" type="number" min="80" max="180" required></label>
           <label>巡游 PWM<input name="nav_speed" type="number" min="65" max="180" required></label>
           <label>前进一格（ms）<input name="step_ms" type="number" min="130" max="1800" required></label>
@@ -252,6 +253,8 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600;overflow-wrap:anywhere}
           <label>播报音量（%）<input name="volume" type="number" min="0" max="75" required></label>
           <label>回声参考延迟帧<input name="ref_delay" type="number" min="0" max="3" required></label>
         </div>
+        <label class="check"><input type="checkbox" name="quiet_pwm">降低电机啸叫（24 kHz 慢衰减，关闭时为 1 kHz）</label>
+        <label class="check"><input type="checkbox" name="swap_rear">后轮左右互换（后板 A 接右后、B 接左后）</label>
         <div class="fields" id="polarity"></div>
       </details>
       <p class="small">保存后重启并锁定电机。只有重新确认过的起点才能用于寻路。</p>
@@ -288,17 +291,21 @@ const navLabels = {origin_required:'待校准起点',origin_set:'起点已对齐
   orienting:'正在转向',measuring:'正在测距',moving:'正在行驶',replanning:'障碍变化，重新规划',no_route:'暂无可通行路线',
   exploration_done:'可到达区域扫描结束',arrived:'已到达估计目标格',step_limit:'达到本轮步数上限',
   locked:'电机已锁定',motion_timeout:'动作超时',motion_aborted:'动作中断',turn_blocked:'转向被拦截',
-  motion_refused:'前进被拦截',navigation_timeout:'达到本轮时限'};
+  motion_refused:'前进被拦截',navigation_timeout:'达到本轮时限',
+  approach_turning:'正朝声源侧转向',approach_measuring:'转向后重新测距',approach_moving:'正沿车头方向靠近',
+  approach_obstacle:'前方有障碍，已停',approach_no_echo:'测距无效，已停',approach_timeout:'已到靠近时限',
+  approach_cancelled:'已取消靠近',approach_refused:'靠近未启动'};
 const cloudLabels = {idle:'就绪',listening:'本地录音',asr:'DeepSeek 识别',flash:'Flash 生成',tts:'语音合成',speaking:'播报中',
-  asr_done:'语音识别完成',flash_done:'Flash 文字测试完成',tts_done:'播报测试完成',
+  asr_done:'语音识别完成',flash_done:'Flash 文字测试完成',intent_done:'语音意图测试完成',tts_done:'播报测试完成',
   interrupted:'已打断',audio_abort:'录音已取消',asr_error:'识别失败',flash_error:'Flash 失败',tts_error:'合成失败'};
 const cloudActive = new Set(['listening','asr','flash','tts','speaking']);
-const voiceCommands = new Set(['listen','tone','wake_feedback','stop_audio','debug_asr','debug_chat','debug_tts','debug_stream','volume']);
-const cloudTests = '[data-command=debug_asr],[data-command=debug_chat],[data-command=debug_stream]';
+const voiceCommands = new Set(['listen','tone','wake_feedback','stop_audio','debug_asr','debug_chat','debug_tts','debug_stream','debug_intent','volume']);
+const cloudTests = '[data-command=debug_asr],[data-command=debug_chat],[data-command=debug_stream],[data-command=debug_intent]';
 const ttsPaths = {deepseek_ws:'DeepSeek WebSocket',deepseek_http:'DeepSeek HTTP',local:'乐鑫本地合成'};
 const wheels = ['左前','右前','左后','右后'];
 const actions = {move_forward:'前进',move_backward:'后退',turn_left:'左转',turn_right:'右转',happy_wiggle:'摇摆'};
-const motorResults = {idle:'空闲',running:'执行中',done:'已完成',aborted:'已中断'};
+const motorStops = {echo:'未收到完整回波',echo_range:'回波脉宽超出有效范围',stale:'测距采样过期',obstacle:'前方避障保护',lock:'电机锁定',stop:'停车指令',pwm:'PWM 输出故障'};
+const motorResults = {idle:'空闲',running:'执行中',done:'脉冲已发完',aborted:'已中断'};
 const colors = {'.':'#5f8e80','#':'#c57d7e','?':'#1c373b'};
 const directions = {left:'左侧',right:'右侧',center:'中线附近'};
 const paces = {slow:'慢',normal:'正常',fast:'快'};
@@ -436,10 +443,12 @@ function renderMotor(s) {
   } else if (motor.ticket) {
     const target = wheels[motor.wheel] || '整车';
     const action = motor.wheel >= 0 ? (motor.action === 'move_backward' ? '反向' : '正向') : actions[motor.action];
+    const reason = motorStops[motor.stop_reason];
     show('motor_last', '#' + motor.ticket + ' · ' + target + action + ' · PWM ' + motor.pwm + ' · ' +
-         motor.duration_ms + ' ms · ' + motorResults[motor.result]);
+         motor.elapsed_ms + '/' + motor.duration_ms + ' ms · ' + motorResults[motor.result] +
+         (reason ? '（' + reason + '）' : ''));
   } else show('motor_last', '暂无指令');
-  const available = s.armed && motor.result !== 'running' && !s.moving && s.nav.mode === 'idle';
+  const available = s.armed && !motor.braking && motor.result !== 'running' && !s.moving && s.nav.mode === 'idle';
   byId('test_direction').dataset.forwardBlocked = String(s.blocked || !s.valid);
   byId('test_direction').dataset.motorAvailable = String(available);
   updateWheelButtons();
@@ -453,6 +462,13 @@ function updateWheelButtons() {
           (direction.value === 'move_forward' && direction.dataset.forwardBlocked === 'true'));
 }
 byId('test_direction').addEventListener('change', updateWheelButtons);
+byId('edit_stop_cm').addEventListener('click', () => {
+  const input = field('stop_cm');
+  byId('settings').open = true;
+  input.closest('details').open = true;
+  input.focus();
+  input.select();
+});
 byId('clear_sonar').addEventListener('click', () => {
   sonarHistory = [];
   show('sonar_samples', '—');
@@ -531,7 +547,7 @@ function render(s) {
     (s.listening ? ' · 收音中' : s.speaking ? ' · 播报中' :
       s.followup_ms > 0 ? ' · 可以追问 ' + Math.ceil(s.followup_ms / 1000) + ' 秒' : ''));
   show('audio_io', 'I²S 读写错误 ' + s.i2s_rx_errors + ' / ' + s.i2s_tx_errors +
-       ' · 播放缓冲耗尽 ' + s.playback_underruns + ' 次');
+       ' · 缓冲耗尽 ' + s.playback_underruns + ' 次 · 插话核验暂停 ' + s.barge_checks + ' 次');
   show('playback_result', ({complete:'完整播完',voice:'插话打断',wake_word:'唤醒词打断',manual:'手动停止',
     i2s_error:'I²S 读写错误',timeout:'等待音频超时',network_lost:'Wi-Fi 断开',
     cloud_error:'音频流异常'})[s.playback_result] || '—');
@@ -595,7 +611,7 @@ async function unlock() {
     byId('live_volume').value = cfg.volume;
     lastVolume = cfg.volume;
     show('volume_display', cfg.volume + '%');
-    for (const k of ['history','barge']) field(k).checked = cfg[k];
+    for (const k of ['history','barge','swap_rear','quiet_pwm']) field(k).checked = cfg[k];
     field('wake_choice').replaceChildren(...cfg.wake_options.map((phrase,i) => new Option(phrase,i)));
     field('wake_choice').value = cfg.wake_choice;
     cfg.polarity.forEach((p,i) => field('polarity'+i).value = p);
@@ -648,15 +664,17 @@ byId('panel').addEventListener('click', e => {
   }
   if (cmd === 'home') { body.cmd = 'goto_name'; body.name = '起点'; }
   if (button.dataset.place) body.name = button.dataset.place;
-  if (cmd === 'wheel_test') {
+  if (cmd === 'wheel_test' || button.hasAttribute('data-drive')) {
     const pwm = byId('test_pwm'), duration = byId('test_ms');
     if (!pwm.reportValidity() || !duration.reportValidity()) return;
-    body.cmd = byId('test_direction').value;
-    body.wheel = Number(button.dataset.wheel);
+    if (cmd === 'wheel_test') {
+      body.cmd = byId('test_direction').value;
+      body.wheel = Number(button.dataset.wheel);
+    }
     body.speed = Number(pwm.value);
     body.duration_ms = Number(duration.value);
   }
-  if (cmd === 'debug_chat' || cmd === 'debug_tts' || cmd === 'debug_stream') {
+  if (cmd === 'debug_chat' || cmd === 'debug_tts' || cmd === 'debug_stream' || cmd === 'debug_intent') {
     const input = byId('debug_text');
     body.text = input.value.trim();
     if (!body.text) {
@@ -716,6 +734,7 @@ form.addEventListener('submit', async e => {
     wake_choice:Number(field('wake_choice').value),
     profile:field('profile').value,
     history:field('history').checked, barge:field('barge').checked,
+    swap_rear:field('swap_rear').checked, quiet_pwm:field('quiet_pwm').checked,
     polarity:[0,1,2,3].map(i => Number(field('polarity'+i).value))};
   for (const k of numeric) payload[k] = Number(field(k).value);
   if (field('ap_password').value) payload.ap_password = field('ap_password').value;

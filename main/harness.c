@@ -23,9 +23,11 @@ static struct {
 static SemaphoreHandle_t lock;
 
 static const char *PROMPT =
-    "你是会说话的小车，和四岁孩子用普通话聊天。先直答，用一两句自然短句，故事讲一小段。"
-    "语气温柔，不说教、不索要个人信息，遇危险请找身边大人。只说要念出来的话，不用列表或表情。"
-    "车况以本轮实测为准，缺数据就说不知道，不承诺动作已执行。";
+    "你是孩子身边的一辆智能小车，用第一人称说自然的普通话。可以一起玩、聊天、观察车头前方。"
+    "听懂后直接回答，按内容用一两句，故事可以多讲几句。跟着她刚说的话聊，少用固定开场，不每次反问。"
+    "她只有四岁。用简单词，尊重她的想法。没听清就只问最需要确认的一点。"
+    "车况只按传感器和固件给出的结果说。别把距离说成人的位置，也别说自己看见了什么或已经做了动作。"
+    "处理不了的动作就用一句话解释并给个能做的近似选择。遇到危险请她找身边的大人。只返回可以直接念出来的话。";
 
 static const char *HARDWARE_PROMPT =
     "speech_direction 是本轮话音相对小车的左右方位；center 分不清前后，unknown 表示没听清。"
@@ -34,9 +36,15 @@ static const char *HARDWARE_PROMPT =
     "motors_armed 为电机启用，front_blocked 为前进保护，voice_pace 为语音速度档。";
 
 static const char *ACTION_PROMPT =
-    "只判定本轮是否明确要求一个动作。否定、引用、问句或多动作选 none。"
-    "只返回 JSON {\"action\":\"none\"}，值限 none、move_forward、move_backward、turn_left、turn_right、"
-    "happy_wiggle、explore、navigate、mark、remember、face_sound。执行由小车校验。";
+    "你是智能小车的语音意图翻译器。输入是可能有同音错字的普通话转写。"
+    "只把明确要求这辆小车现在做的一件事转为动作。把客气问法当请求，如你能朝右边转一点吗→turn_right。"
+    "往前、向前挪、明显误写的网前→move_forward。往后、倒一下、退一小步、网后→move_backward。"
+    "朝左、朝右、拐向左/右→turn_left或turn_right。停一下、别再开了→stop。"
+    "到我这边、开过来、靠近我→approach。只朝我转→face_sound。扭一扭→happy_wiggle。"
+    "开始建图或巡游→explore，去已命名地点→navigate，标记地点→mark，记住偏好→remember。"
+    "否定动作、转述、引用、讨论能否做到、询问车况、连续动作、跟随移动的人和不确定时→none。"
+    "只返回 JSON {\"action\":\"none\"}。需要时加 pace，值仅 slow、normal、fast。"
+    "不得输出 GPIO、距离、PWM、动作序列或自行发明动作名。";
 
 static bool save(void)
 {
@@ -147,15 +155,14 @@ cJSON *harness_hardware_json(const hardware_context_t *hardware)
     return json;
 }
 
-char *harness_request(const char *text, const char *intent, bool include_context, bool streamed,
+char *harness_request(const char *text, bool action_only, bool include_context, bool streamed,
                       const hardware_context_t *hardware)
 {
     cJSON *body = cJSON_CreateObject();
     if (!body) return NULL;
     cJSON_AddStringToObject(body, "model", "deepseek-flash");
     const char *const long_request[] = {"故事", "后来", "接着讲", "详细", "继续讲", NULL};
-    bool action_only = strcmp(intent, "none") != 0;
-    cJSON_AddNumberToObject(body, "max_tokens", action_only ? 32 : mentions(text, long_request) ? 200 : 112);
+    cJSON_AddNumberToObject(body, "max_tokens", action_only ? 48 : mentions(text, long_request) ? 200 : 112);
     cJSON_AddBoolToObject(body, "stream", streamed);
     cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "thinking"), "type", "disabled");
     if (streamed) {

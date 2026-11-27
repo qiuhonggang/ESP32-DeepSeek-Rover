@@ -16,10 +16,11 @@ enum {
     SAMPLE_RATE = 16000, MAX_FRAME = 512, MAX_WIRE_BYTES = 2048,
 };
 
-typedef enum { SRC_NAV = 1, SRC_CLOUD, SRC_WEB } motion_source_t;
+typedef enum { SRC_NAV = 1, SRC_CLOUD, SRC_WEB, SRC_APPROACH } motion_source_t;
 typedef enum { STOP, FORWARD, BACK, LEFT, RIGHT, WIGGLE } action_t;
 typedef enum { DIR_UNKNOWN, DIR_LEFT, DIR_CENTER, DIR_RIGHT } direction_t;
 typedef enum { MOTION_IDLE, MOTION_RUNNING, MOTION_DONE, MOTION_ABORTED } motion_result_t;
+enum { APPROACH_LIMIT_MS = 6000, APPROACH_MAX_PWM = 145 };
 typedef enum {
     PLAYBACK_NONE, PLAYBACK_COMPLETE, PLAYBACK_WAKE_WORD, PLAYBACK_MANUAL,
     PLAYBACK_I2S_ERROR, PLAYBACK_TIMEOUT, PLAYBACK_NETWORK_LOST, PLAYBACK_CLOUD_ERROR, PLAYBACK_VOICE,
@@ -36,20 +37,23 @@ typedef struct {
     char ap_password[64];
     wifi_profiles_t wifi_profiles;
     uint32_t tts_local;  // Appended to preserve the NVS v4 prefix.
+    uint32_t swap_rear;  // Appended after the NVS v5 prefix.
+    uint32_t quiet_pwm;  // Appended after the NVS v6 prefix.
 } robot_config_t;
 
 typedef struct {
     int cm;
-    bool valid, blocked, armed, moving, output_fault;
+    bool valid, blocked, armed, moving, braking, output_fault;
     uint32_t measurement, ticket;
-    int echo_us, sample_age_ms, wheel, pwm, duration_ms;
+    int echo_us, sample_age_ms, wheel, pwm, duration_ms, elapsed_ms;
+    const char *stop_reason;
     motion_result_t result;
     action_t action, last_action;
 } motion_status_t;
 
 typedef struct {
     int left_rms, right_rms, speech_rms;
-    uint32_t i2s_rx_errors, i2s_tx_errors, playback_underruns, wake_cue;
+    uint32_t i2s_rx_errors, i2s_tx_errors, playback_underruns, barge_checks, wake_cue;
     int followup_ms;
     direction_t direction;
     playback_result_t playback_result;
@@ -74,6 +78,7 @@ uint32_t motion_submit(action_t action, int speed, int duration_ms, motion_sourc
 bool motion_arm(void);
 void motion_stop(bool disarm);
 motion_status_t motion_status(void);
+int motion_approach_clearance_cm(action_t action);
 action_t action_from_name(const char *name);
 const char *action_name(action_t action);
 

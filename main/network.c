@@ -28,7 +28,7 @@
 
 static const char *TAG = "network";
 robot_config_t robot_config = {
-    .voice = "stella", .stop_cm = 20, .speed = 145, .nav_speed = 103,
+    .voice = "stella", .stop_cm = 10, .speed = 145, .nav_speed = 103,
     .step_ms = 690, .turn_left_ms = 520, .turn_right_ms = 520, .cell_cm = 25,
     .polarity = {1, 1, 1, 1}, .vad_rms = 295, .barge_rms = 530,
     .mic_spacing_mm = 100, .volume = 28, .ref_delay = 0, .history = true, .barge = true,
@@ -46,7 +46,7 @@ extern const char console_start[] asm("_binary_console_html_start");
 typedef struct { const char *name; size_t field; int min, max; } tune_t;
 #define TUNE(f, low, high) {#f, offsetof(robot_config_t, f), low, high}
 static const tune_t settings[] = {
-    TUNE(stop_cm, 15, 100), TUNE(speed, 80, 180), TUNE(nav_speed, 65, 180),
+    TUNE(stop_cm, 10, 100), TUNE(speed, 80, 180), TUNE(nav_speed, 65, 180),
     TUNE(step_ms, 130, 1800), TUNE(turn_left_ms, 120, 1700), TUNE(turn_right_ms, 120, 1700),
     TUNE(cell_cm, 20, 45), TUNE(vad_rms, 50, 3500), TUNE(barge_rms, 80, 4500),
     TUNE(mic_spacing_mm, 40, 220), TUNE(volume, 0, 75), TUNE(ref_delay, 0, 3),
@@ -58,7 +58,7 @@ static esp_err_t save_config(const robot_config_t *config)
     nvs_handle_t nvs;
     esp_err_t result = nvs_open(STORE, NVS_READWRITE, &nvs);
     if (result != ESP_OK) return result;
-    result = nvs_set_blob(nvs, "config-v5", config, sizeof(*config));
+    result = nvs_set_blob(nvs, "config-v7", config, sizeof(*config));
     if (result == ESP_OK) result = nvs_commit(nvs);
     nvs_close(nvs);
     return result;
@@ -72,7 +72,9 @@ void network_load_config(void)
     nvs_handle_t nvs;
     if (nvs_open(STORE, NVS_READONLY, &nvs) == ESP_OK) {
         const struct { const char *key; size_t bytes; } versions[] = {
-            {"config-v5", sizeof(robot_config_t)},
+            {"config-v7", sizeof(robot_config_t)},
+            {"config-v6", offsetof(robot_config_t, quiet_pwm)},
+            {"config-v5", offsetof(robot_config_t, swap_rear)},
             {"config-v4", offsetof(robot_config_t, tts_local)},
             {"config-v3", offsetof(robot_config_t, wifi_profiles)},
             {"config-v2", offsetof(robot_config_t, ap_password)},
@@ -85,7 +87,7 @@ void network_load_config(void)
                 length != versions[i].bytes || saved.wifi_profiles.count > WIFI_PROFILE_LIMIT) continue;
             robot_config = saved;
             migrated = i > 0;
-            legacy_wifi = i > 1;
+            legacy_wifi = versions[i].bytes <= offsetof(robot_config_t, wifi_profiles);
             break;
         }
         nvs_close(nvs);
@@ -96,6 +98,8 @@ void network_load_config(void)
         memset(robot_config.legacy_ssid, 0, sizeof(robot_config.legacy_ssid));
         memset(robot_config.legacy_password, 0, sizeof(robot_config.legacy_password));
     }
+    robot_config.quiet_pwm = robot_config.quiet_pwm == 1;
+    robot_config.swap_rear = robot_config.swap_rear == 1;
     robot_config.tts_local = robot_config.tts_local == 1;
     if (robot_config.wake_choice >= wake_option_count) robot_config.wake_choice = 0;
     if (!robot_config.console_key[0]) {
@@ -352,6 +356,9 @@ static esp_err_t get_status(httpd_req_t *req)
         cJSON *motor = cJSON_AddObjectToObject(json, "motor");
         const char *results[] = {"idle", "running", "done", "aborted"};
         cJSON_AddStringToObject(motor, "result", results[chassis.result]);
+        cJSON_AddBoolToObject(motor, "braking", chassis.braking);
+        cJSON_AddNumberToObject(motor, "elapsed_ms", chassis.elapsed_ms);
+        if (chassis.stop_reason) cJSON_AddStringToObject(motor, "stop_reason", chassis.stop_reason);
         cJSON_AddBoolToObject(motor, "output_fault", chassis.output_fault);
         cJSON_AddNumberToObject(motor, "ticket", chassis.ticket);
         cJSON_AddStringToObject(motor, "action", action_name(chassis.last_action));
@@ -364,6 +371,7 @@ static esp_err_t get_status(httpd_req_t *req)
         cJSON_AddNumberToObject(json, "i2s_rx_errors", audio.i2s_rx_errors);
         cJSON_AddNumberToObject(json, "i2s_tx_errors", audio.i2s_tx_errors);
         cJSON_AddNumberToObject(json, "playback_underruns", audio.playback_underruns);
+        cJSON_AddNumberToObject(json, "barge_checks", audio.barge_checks);
         cJSON_AddStringToObject(json, "playback_result", playback_result_name(audio.playback_result));
         cJSON_AddNumberToObject(json, "wake_cue", audio.wake_cue);
         cJSON_AddNumberToObject(json, "volume", audio_volume());
@@ -419,6 +427,8 @@ static esp_err_t get_config(httpd_req_t *req)
             cJSON_AddNumberToObject(json, settings[i].name, *tuning_value(&robot_config, &settings[i]));
         }
         xSemaphoreGive(config_lock);
+        cJSON_AddBoolToObject(json, "quiet_pwm", robot_config.quiet_pwm);
+        cJSON_AddBoolToObject(json, "swap_rear", robot_config.swap_rear);
         cJSON_AddItemToObject(json, "polarity", cJSON_CreateIntArray(robot_config.polarity, 4));
     }
     return send_json(req, json);
@@ -502,6 +512,16 @@ static bool apply_config(cJSON *json, robot_config_t *next)
         if (cJSON_HasObjectItem(json, field->name)) *value = get_int(json, field->name, -1);
         if (*value < field->min || *value > field->max) return false;
     }
+    const cJSON *quiet = cJSON_GetObjectItemCaseSensitive(json, "quiet_pwm");
+    if (quiet) {
+        if (!cJSON_IsBool(quiet)) return false;
+        next->quiet_pwm = cJSON_IsTrue(quiet);
+    }
+    const cJSON *swap = cJSON_GetObjectItemCaseSensitive(json, "swap_rear");
+    if (swap) {
+        if (!cJSON_IsBool(swap)) return false;
+        next->swap_rear = cJSON_IsTrue(swap);
+    }
     const cJSON *wheels = cJSON_GetObjectItemCaseSensitive(json, "polarity");
     if (wheels) {
         if (!cJSON_IsArray(wheels) || cJSON_GetArraySize(wheels) != 4) return false;
@@ -580,7 +600,8 @@ static bool control(const cJSON *json)
     if (!strcmp(cmd, "listen") || !strcmp(cmd, "debug_asr")) {
         return audio_listen_once(!strcmp(cmd, "debug_asr"));
     }
-    if (!strcmp(cmd, "debug_chat") || !strcmp(cmd, "debug_tts") || !strcmp(cmd, "debug_stream")) {
+    if (!strcmp(cmd, "debug_chat") || !strcmp(cmd, "debug_tts") || !strcmp(cmd, "debug_stream") ||
+        !strcmp(cmd, "debug_intent")) {
         return cloud_debug_text(get_text(json, "text"), cmd);
     }
     if (!strcmp(cmd, "stop_audio")) {

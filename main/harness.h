@@ -12,7 +12,7 @@ typedef struct {
 void harness_start(void);
 const char *voice_pace_name(voice_pace_t pace);
 cJSON *harness_hardware_json(const hardware_context_t *hardware);
-char *harness_request(const char *text, const char *intent, bool include_context, bool streamed,
+char *harness_request(const char *text, bool action_only, bool include_context, bool streamed,
                       const hardware_context_t *hardware);
 void harness_add_turn(const char *user, const char *reply);
 bool harness_remember(const char *note);

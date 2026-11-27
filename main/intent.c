@@ -88,6 +88,19 @@ static bool short_suffix(const char *suffix)
     return in(suffix, allowed);
 }
 
+static bool drive_suffix(const char *suffix)
+{
+    static const char *const amounts[] = {
+        "一小步", "一点儿", "一点点", "一下子", "一点", "一下", "一步", NULL,
+    };
+    static const char *const endings[] = {"", "吧", "呀", "哦", "好吗", "好不好", "可以吗", "行吗", "吗", NULL};
+    for (size_t i = 0; amounts[i]; ++i) {
+        const char *after = consume(suffix, amounts[i]);
+        if (after) return in(after, endings);
+    }
+    return in(suffix, endings);
+}
+
 static const struct { const char *phrase; voice_pace_t pace; } pace_words[] = {
     {"慢一点", PACE_SLOW}, {"慢一些", PACE_SLOW}, {"慢点", PACE_SLOW}, {"慢慢", PACE_SLOW},
     {"慢速", PACE_SLOW}, {"快一点", PACE_FAST}, {"快一些", PACE_FAST}, {"快点", PACE_FAST},
@@ -106,6 +119,48 @@ static voice_pace_t pace_word(const char *text, const char **rest)
     }
     *rest = text;
     return PACE_CURRENT;
+}
+
+static void drive_intent(const char *text, intent_t *intent)
+{
+    static const char *const lead_ins[] = {
+        "能不能", "可不可以", "可以", "能", "麻烦你", "帮我", "给我", "请", "再", "先", NULL,
+    };
+    for (int i = 0; i < 3; ++i) {
+        const char *after = NULL;
+        for (size_t j = 0; lead_ins[j] && !after; ++j) after = consume(text, lead_ins[j]);
+        if (!after) break;
+        text = after;
+        size_t skip;
+        while ((skip = pause_separator(text)) != 0) text += skip;
+    }
+    const char *drive;
+    voice_pace_t prefix_pace = pace_word(text, &drive);
+    static const struct { const char *phrase; action_t action; } moves[] = {
+        {"前进", FORWARD}, {"往前", FORWARD}, {"向前", FORWARD}, {"朝前", FORWARD},
+        {"往前走", FORWARD}, {"向前走", FORWARD}, {"往前开", FORWARD}, {"向前开", FORWARD},
+        {"往前挪", FORWARD}, {"向前挪", FORWARD}, {"朝前走", FORWARD}, {"朝前开", FORWARD},
+        {"后退", BACK}, {"退后", BACK}, {"往后", BACK}, {"向后", BACK}, {"倒车", BACK},
+        {"往后走", BACK}, {"向后走", BACK}, {"往后退", BACK}, {"向后退", BACK},
+        {"往后倒", BACK}, {"往后挪", BACK}, {"退", BACK},
+        {"左转", LEFT}, {"向左转", LEFT}, {"往左转", LEFT}, {"左拐", LEFT},
+        {"朝左转", LEFT}, {"朝左边转", LEFT}, {"往左边转", LEFT},
+        {"右转", RIGHT}, {"向右转", RIGHT}, {"往右转", RIGHT}, {"右拐", RIGHT},
+        {"朝右转", RIGHT}, {"朝右边转", RIGHT}, {"往右边转", RIGHT},
+        {"扭一扭", WIGGLE}, {"扭一下", WIGGLE}, {"摆一摆", WIGGLE},
+    };
+    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); ++i) {
+        const char *rest = consume(drive, moves[i].phrase);
+        if (!rest) continue;
+        const char *suffix;
+        voice_pace_t suffix_pace = pace_word(rest, &suffix);
+        if ((!prefix_pace || !suffix_pace) && drive_suffix(suffix)) {
+            intent->type = INTENT_DRIVE;
+            intent->action = moves[i].action;
+            intent->pace = prefix_pace ? prefix_pace : suffix_pace;
+            return;
+        }
+    }
 }
 
 static int chinese_digit(const char **text)
@@ -205,6 +260,7 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
         normalized[count++] = c < 128 ? (char)tolower(c) : (char)c;
     }
+    if (*transcript) return result;
     normalized[count] = 0;
     while (count && normalized[count - 1] != '%' && punctuation(normalized + count - 1) == 1) {
         normalized[--count] = 0;
@@ -228,7 +284,7 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
     const char *const end_dialog[] = {"不聊了", "先不聊了", "退出对话", "结束对话", NULL};
     if (in(text, end_dialog)) { result.type = INTENT_END_DIALOG; return result; }
     const char *const stop[] = {"停", "停下", "停下来", "停止", "停止巡游", "停止导航",
-                                "别动", "不要动", "停车", "停下吧", NULL};
+                                "别动", "不要动", "停车", "停下吧", "停一下", "先停一下", "快停下", NULL};
     if (in(text, stop)) { result.type = INTENT_STOP; return result; }
     const char *const lock[] = {"急停", "锁定电机", "关闭电机", "关掉电机", "停止电机", "关闭马达", NULL};
     if (in(text, lock)) { result.type = INTENT_MOTOR_LOCK; return result; }
@@ -263,27 +319,8 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
         result.pace = chosen;
         return result;
     }
-    const char *drive;
-    voice_pace_t prefix_pace = pace_word(text, &drive);
-    const struct { const char *prefix; action_t action; } moves[] = {
-        {"前进", FORWARD}, {"往前走", FORWARD}, {"向前走", FORWARD}, {"往前开", FORWARD},
-        {"后退", BACK}, {"往后走", BACK}, {"向后走", BACK},
-        {"左转", LEFT}, {"向左转", LEFT}, {"往左转", LEFT}, {"左拐", LEFT},
-        {"右转", RIGHT}, {"向右转", RIGHT}, {"往右转", RIGHT}, {"右拐", RIGHT},
-        {"扭一扭", WIGGLE}, {"扭一下", WIGGLE}, {"摆一摆", WIGGLE},
-    };
-    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); ++i) {
-        const char *rest = consume(drive, moves[i].prefix);
-        if (!rest) continue;
-        const char *suffix;
-        voice_pace_t suffix_pace = pace_word(rest, &suffix);
-        if ((!prefix_pace || !suffix_pace) && short_suffix(suffix)) {
-            result.type = INTENT_DRIVE;
-            result.action = moves[i].action;
-            result.pace = prefix_pace ? prefix_pace : suffix_pace;
-            return result;
-        }
-    }
+    drive_intent(text, &result);
+    if (result.type == INTENT_DRIVE) return result;
 
     const char *name = consume(text, "把这里记为");
     if (!name) name = consume(text, "标记这里为");
@@ -304,4 +341,90 @@ intent_t intent_from_transcript(const char *transcript, const wake_option_t *wak
         text_copy(result.argument, sizeof(result.argument), name);
     }
     return result;
+}
+
+static bool contains_any(const char *text, const char *const *words)
+{
+    for (size_t i = 0; words[i]; ++i) {
+        if (strstr(text, words[i])) return true;
+    }
+    return false;
+}
+
+static const char *const approach_words[] = {
+    "过来", "过來", "过莱", "到我", "来我", "来这", "到这", "靠近", "靠过来", "向我开", "朝我开", NULL,
+};
+
+bool intent_model_candidate(const char *transcript, intent_t parsed)
+{
+    if (parsed.type != INTENT_CHAT) return true;
+    static const char *const cues[] = {
+        "前", "后", "左", "右", "转", "停车", "停下", "停住", "不动", "别动", "别走", "别开",
+        "走", "倒", "退", "开车", "挪", "这边", "绕", "扭", "摆", "网钱", "往钱", "往厚",
+        "动一", "巡游", "建图", "面向我", NULL,
+    };
+    return contains_any(transcript, cues) || contains_any(transcript, approach_words);
+}
+
+intent_t intent_from_model(const char *transcript, intent_t parsed, const char *action, const char *pace)
+{
+    const intent_t no_action = {.type = INTENT_CHAT, .action = STOP};
+    if (!action || !intent_model_candidate(transcript, parsed)) return no_action;
+    static const char *const reported_or_composite[] = {
+        "说过", "他说", "她说", "我说过", "我没说", "说一遍", "命令是", "比如", "例如",
+        "然后", "接着再", "之后再", "同时", "还是", "先前进再", "先往前再", "先右转再", "先左转再",
+        "怎么", "为什么", "什么", "是不是", "会不会", "多远", "多快", "有没有",
+        "“", "”", "‘", "’", "\"", NULL,
+    };
+    if (contains_any(transcript, reported_or_composite)) return no_action;
+    if (!strcmp(action, "stop")) return (intent_t){.type = INTENT_STOP};
+    static const char *const negative[] = {
+        "不要", "别", "不用", "不许", "没让", "并非", "不准", NULL,
+    };
+    if (contains_any(transcript, negative)) return no_action;
+    const char *unable = transcript;
+    while ((unable = strstr(unable, "不能")) != NULL) {
+        if (unable - transcript < 3 || memcmp(unable - 3, "能", 3)) return no_action;
+        unable += strlen("不能");
+    }
+
+    static const struct { const char *name; action_t motion; } motions[] = {
+        {"move_forward", FORWARD}, {"move_backward", BACK}, {"turn_left", LEFT},
+        {"turn_right", RIGHT}, {"happy_wiggle", WIGGLE},
+    };
+    for (size_t i = 0; i < sizeof(motions) / sizeof(motions[0]); ++i) {
+        if (strcmp(action, motions[i].name)) continue;
+        if (parsed.type != INTENT_CHAT && (parsed.type != INTENT_DRIVE || parsed.action != motions[i].motion)) {
+            return no_action;
+        }
+        voice_pace_t speed = parsed.pace;
+        if (!speed && pace) {
+            if (!strcmp(pace, "slow")) speed = PACE_SLOW;
+            if (!strcmp(pace, "fast")) speed = PACE_FAST;
+            if (!strcmp(pace, "normal")) speed = PACE_NORMAL;
+        }
+        return (intent_t){.type = INTENT_DRIVE, .action = motions[i].motion, .pace = speed};
+    }
+    if (!strcmp(action, "approach") && (parsed.type == INTENT_CHAT || parsed.type == INTENT_GOTO) &&
+        contains_any(transcript, approach_words)) {
+        return (intent_t){.type = INTENT_APPROACH};
+    }
+    if (!strcmp(action, "face_sound") && (parsed.type == INTENT_CHAT || parsed.type == INTENT_FACE_SOUND)) {
+        return (intent_t){.type = INTENT_FACE_SOUND};
+    }
+    if ((!strcmp(action, "explore") && parsed.type == INTENT_EXPLORE) ||
+        (!strcmp(action, "navigate") && parsed.type == INTENT_GOTO) ||
+        (!strcmp(action, "mark") && parsed.type == INTENT_MARK) ||
+        (!strcmp(action, "remember") && parsed.type == INTENT_REMEMBER)) return parsed;
+    return no_action;
+}
+
+direction_t intent_approach_direction(const char *transcript, direction_t direction)
+{
+    static const char *const in_front[] = {
+        "我在你前面", "我在你正前方", "我在你前方", "我在车头前面", "我在车头前方",
+        "我在车头的前面", "我就在你前面", NULL,
+    };
+    if (direction == DIR_CENTER && !contains_any(transcript, in_front)) return DIR_UNKNOWN;
+    return direction;
 }

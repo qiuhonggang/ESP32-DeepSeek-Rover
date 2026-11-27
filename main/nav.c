@@ -12,7 +12,7 @@
 #define LABEL_BYTES 37
 #define MAP_VERSION 1
 
-typedef enum { NAV_IDLE, NAV_EXPLORE, NAV_GOAL } nav_mode_t;
+typedef enum { NAV_IDLE, NAV_EXPLORE, NAV_GOAL, NAV_APPROACH } nav_mode_t;
 typedef enum { DECIDE, ORIENT, MEASURE } nav_phase_t;
 
 static const cell_pos_t HOME = {GRID_CENTER, GRID_CENTER};
@@ -31,6 +31,8 @@ static struct {
     nav_phase_t phase;
     action_t issued;
     uint32_t ticket, measure_seq;
+    uint32_t approach_turn;
+    int approach_speed;
     int readings[3], count;
     bool pose, scanning;
     int steps;
@@ -38,11 +40,12 @@ static struct {
     const char *message;
 } nav = {.message = "origin_required"};
 
-static const char *const MODE_NAMES[] = {"idle", "explore", "route"};
+static const char *const MODE_NAMES[] = {"idle", "explore", "route", "approach"};
 
 static void end(const char *message, bool disarm)
 {
-    if (nav.ticket) {
+    bool approaching = nav.mode == NAV_APPROACH;
+    if (nav.ticket && !approaching) {
         motion_status_t status = motion_status();
         if (nav.ticket == status.ticket && status.result == MOTION_DONE) {
             if (nav.issued == FORWARD) nav.pos = nav.next;
@@ -55,7 +58,7 @@ static void end(const char *message, bool disarm)
     nav.ticket = 0;
     nav.mode = NAV_IDLE;
     nav.phase = DECIDE;
-    nav.message = nav.pose ? message : "origin_required";
+    nav.message = approaching || nav.pose ? message : "origin_required";
     motion_stop(disarm);
 }
 
@@ -128,6 +131,38 @@ bool nav_explore_for_turn(uint32_t turn)
 
 bool nav_explore(void) { return nav_explore_for_turn(0); }
 
+bool nav_approach_for_turn(direction_t direction, int speed, uint32_t turn)
+{
+    if (!turn || direction < DIR_LEFT || direction > DIR_RIGHT) return false;
+
+    xSemaphoreTake(lock, portMAX_DELAY);
+    uint32_t ticket = 0;
+    if (map_task_ready && nav.mode == NAV_IDLE && turn_valid(turn)) {
+        action_t action = direction == DIR_LEFT ? LEFT : direction == DIR_RIGHT ? RIGHT : FORWARD;
+        int duration_ms = APPROACH_LIMIT_MS;
+        int pwm = speed;
+        if (action != FORWARD) {
+            // The left and right calibration values describe 90° at nav_speed.
+            duration_ms = (action == LEFT ? robot_config.turn_left_ms : robot_config.turn_right_ms) / 2;
+            pwm = robot_config.nav_speed;
+        }
+        int64_t now = esp_timer_get_time();
+        ticket = motion_submit(action, pwm, duration_ms, SRC_APPROACH, -1);
+        if (ticket) {
+            nav.mode = NAV_APPROACH;
+            nav.ticket = ticket;
+            nav.pose = false;
+            nav.issued = action;
+            nav.approach_turn = turn;
+            nav.approach_speed = speed;
+            nav.run_until = now + (int64_t)APPROACH_LIMIT_MS * 1000;
+            nav.message = action == FORWARD ? "approach_moving" : "approach_turning";
+        }
+    }
+    xSemaphoreGive(lock);
+    return ticket != 0;
+}
+
 bool nav_go(cell_pos_t goal)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
@@ -189,7 +224,8 @@ bool nav_mark(const char *name) { return nav_mark_for_turn(name, 0); }
 void nav_stop(bool disarm)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    end("stopped", disarm);
+    const char *message = nav.mode == NAV_APPROACH ? (disarm ? "locked" : "approach_cancelled") : "stopped";
+    end(message, disarm);
     xSemaphoreGive(lock);
 }
 
@@ -289,10 +325,82 @@ static void choose_next(void)
     nav.message = "orienting";
 }
 
+static const char *approach_abort_reason(const char *reason)
+{
+    if (!reason) return "approach_refused";
+    if (!strcmp(reason, "obstacle")) return "approach_obstacle";
+    if (!strcmp(reason, "echo") || !strcmp(reason, "echo_range") || !strcmp(reason, "stale")) {
+        return "approach_no_echo";
+    }
+    if (!strcmp(reason, "lock")) return "locked";
+    if (!strcmp(reason, "stop")) return "approach_cancelled";
+    return "approach_refused";
+}
+
+static void approach_tick(int64_t now, motion_status_t chassis)
+{
+    if (!chassis.armed) {
+        end("locked", false);
+        return;
+    }
+    if (!turn_valid(nav.approach_turn)) {
+        end("approach_cancelled", false);
+        return;
+    }
+    if (now >= nav.run_until) {
+        end("approach_timeout", false);
+        return;
+    }
+    if (nav.ticket) {
+        if (chassis.ticket != nav.ticket) {
+            end("approach_refused", false);
+        } else if (chassis.result == MOTION_ABORTED) {
+            end(approach_abort_reason(chassis.stop_reason), false);
+        } else if (chassis.result == MOTION_DONE) {
+            if (nav.issued == FORWARD) {
+                end("approach_timeout", false);
+            } else {
+                nav.ticket = 0;
+                nav.measure_seq = chassis.measurement;
+                nav.settle = now + 130000;
+                nav.message = "approach_measuring";
+            }
+        }
+        return;
+    }
+    if (!chassis.valid) {
+        end("approach_no_echo", false);
+        return;
+    }
+    if (chassis.blocked || chassis.cm <= motion_approach_clearance_cm(FORWARD)) {
+        end("approach_obstacle", false);
+        return;
+    }
+    if (now < nav.settle || chassis.measurement == nav.measure_seq ||
+        chassis.sample_age_ms < 0 || chassis.sample_age_ms > (now - nav.settle) / 1000) return;
+
+    int remaining_ms = (nav.run_until - now) / 1000;
+    if (remaining_ms < 80) {
+        end("approach_timeout", false);
+        return;
+    }
+    nav.ticket = motion_submit(FORWARD, nav.approach_speed, remaining_ms, SRC_APPROACH, -1);
+    if (nav.ticket) {
+        nav.issued = FORWARD;
+        nav.message = "approach_moving";
+    } else {
+        end("approach_refused", false);
+    }
+}
+
 static void planner_tick(int64_t now)
 {
     if (nav.mode == NAV_IDLE) return;
     motion_status_t chassis = motion_status();
+    if (nav.mode == NAV_APPROACH) {
+        approach_tick(now, chassis);
+        return;
+    }
     if (now > nav.run_until) {
         end("navigation_timeout", false);
         return;

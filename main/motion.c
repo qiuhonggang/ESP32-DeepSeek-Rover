@@ -19,22 +19,45 @@ static portMUX_TYPE guard = portMUX_INITIALIZER_UNLOCKED;
 static motion_status_t status = {.cm = -1, .sample_age_ms = -1, .wheel = -1, .blocked = true};
 static struct {
     action_t action;
+    motion_source_t source;
     int speed, duration_ms, wheel;
     int64_t started, until;
 } command;
-static int64_t brake_until, armed_until, last_measurement;
+static int64_t brake_until, armed_until, last_measurement, last_valid_measurement;
 static int64_t echo_rise, echo_width;
 static bool echo_open, initialized;
 static TaskHandle_t sonar_handle;
 
-static bool shift_allowed(action_t action, int64_t now)
+static const int MAX_SAMPLE_AGE_US = 170000;
+
+int motion_approach_clearance_cm(action_t action)
 {
-    bool fresh = status.valid && now - last_measurement < 170000;
+    int cm = robot_config.stop_cm > 25 ? robot_config.stop_cm : 25;
+    return action == FORWARD ? cm : cm + 5;
+}
+
+static bool shift_allowed(action_t action, motion_source_t source, int64_t now)
+{
+    bool fresh = status.valid && now - last_measurement < MAX_SAMPLE_AGE_US;
+    if (source == SRC_APPROACH) return fresh && !status.blocked && status.cm > motion_approach_clearance_cm(action);
     if (action == FORWARD) return fresh && !status.blocked;
     if (action == LEFT || action == RIGHT || action == WIGGLE) {
         return !fresh || status.cm > 10;
     }
     return true;
+}
+
+static bool single_wheel_forward_running(void)
+{
+    return command.action == FORWARD && command.wheel >= 0 && command.started != 0;
+}
+
+static bool waiting_for_single_wheel_echo(int64_t now)
+{
+    // A missing echo can retain a clear gate for one ping during a running dot.
+    // Only the motor loop can use that gate without a valid latest sample.
+    return single_wheel_forward_running() && !status.valid && !status.blocked &&
+           status.echo_us == 0 && now - last_valid_measurement < MAX_SAMPLE_AGE_US;
 }
 
 action_t action_from_name(const char *name)
@@ -56,34 +79,43 @@ motion_status_t motion_status(void)
 {
     taskENTER_CRITICAL(&guard);
     motion_status_t copy = status;
-    int64_t age_us = esp_timer_get_time() - last_measurement;
+    int64_t now = esp_timer_get_time();
+    copy.braking = now < brake_until;
+    if (command.started && command.action != STOP) copy.elapsed_ms = (now - command.started) / 1000;
+    int64_t age_us = now - last_measurement;
     if (last_measurement) copy.sample_age_ms = (int)(age_us / 1000);
-    if (age_us >= 170000) {
+    if (age_us >= MAX_SAMPLE_AGE_US) {
         copy.valid = false;
-        copy.blocked = true;
         copy.cm = -1;
     }
+    if (!copy.valid) copy.blocked = true;
     taskEXIT_CRITICAL(&guard);
     return copy;
 }
 
 static void stop_locked(int64_t now)
 {
-    if (status.moving) brake_until = now + 100000;
+    if (command.action != STOP && command.started) {
+        status.elapsed_ms = (now - command.started) / 1000;
+        brake_until = now + 100000;
+    }
     command.action = STOP;
     status.action = STOP;
 }
 
-static void finish_locked(motion_result_t result, int64_t now)
+static void abort_locked(const char *reason, int64_t now)
 {
-    if (status.result == MOTION_RUNNING) status.result = result;
+    if (status.result == MOTION_RUNNING) {
+        status.result = MOTION_ABORTED;
+        status.stop_reason = reason;
+    }
     stop_locked(now);
 }
 
 void motion_stop(bool disarm)
 {
     taskENTER_CRITICAL(&guard);
-    finish_locked(MOTION_ABORTED, esp_timer_get_time());
+    abort_locked(disarm ? "lock" : "stop", esp_timer_get_time());
     if (disarm) {
         status.armed = false;
         armed_until = 0;
@@ -96,7 +128,7 @@ bool motion_arm(void)
     taskENTER_CRITICAL(&guard);
     int64_t now = esp_timer_get_time();
     bool allowed = initialized && !status.output_fault && status.result != MOTION_RUNNING &&
-                   now >= brake_until && shift_allowed(FORWARD, now);
+                   now >= brake_until && shift_allowed(FORWARD, SRC_WEB, now);
     if (allowed) {
         status.armed = true;
         armed_until = now + 30LL * 60 * 1000000;
@@ -111,6 +143,11 @@ uint32_t motion_submit(action_t action, int speed, int duration_ms, motion_sourc
         (wheel >= 0 && source != SRC_WEB)) return 0;
     int maximum = action == FORWARD ? 700 : 390;
     if (source == SRC_NAV) maximum = action == FORWARD ? 1800 : 1700;
+    if (source == SRC_APPROACH) {
+        if (action != FORWARD && action != LEFT && action != RIGHT) return 0;
+        maximum = action == FORWARD ? APPROACH_LIMIT_MS : 650;
+        if (speed > APPROACH_MAX_PWM) speed = APPROACH_MAX_PWM;
+    }
     if (wheel >= 0) maximum = 240;
     if (action == BACK && maximum > 250) maximum = 250;
     if (speed < 65) speed = 65;
@@ -123,8 +160,9 @@ uint32_t motion_submit(action_t action, int speed, int duration_ms, motion_sourc
 
     taskENTER_CRITICAL(&guard);
     if (status.armed && now < armed_until && status.result != MOTION_RUNNING &&
-        !status.moving && now >= brake_until && shift_allowed(action, now)) {
+        !status.moving && now >= brake_until && shift_allowed(action, source, now)) {
         command.action = action;
+        command.source = source;
         command.speed = speed;
         command.wheel = wheel;
         command.duration_ms = duration_ms;
@@ -137,6 +175,8 @@ uint32_t motion_submit(action_t action, int speed, int duration_ms, motion_sourc
         status.wheel = wheel;
         status.pwm = speed;
         status.duration_ms = duration_ms;
+        status.elapsed_ms = 0;
+        status.stop_reason = NULL;
         ticket = status.ticket;
     }
     taskEXIT_CRITICAL(&guard);
@@ -164,6 +204,30 @@ static void echo_isr(void *unused)
     }
 }
 
+static void record_sonar_locked(int width_us, int64_t now, int *clear_samples)
+{
+    int stop_cm = robot_config.stop_cm;
+    bool retry = width_us == 0 && single_wheel_forward_running() && status.valid &&
+                 !status.blocked && status.cm >= stop_cm + 5 &&
+                 now - last_valid_measurement < MAX_SAMPLE_AGE_US;
+    status.echo_us = width_us;
+    status.valid = width_us >= 100 && width_us <= 23500;
+    status.cm = status.valid ? (width_us + 29) / 58 : -1;
+    ++status.measurement;
+    last_measurement = now;
+    if (status.valid) last_valid_measurement = now;
+
+    if ((!status.valid && !retry) || (status.valid && status.cm <= stop_cm)) {
+        status.blocked = true;
+        *clear_samples = 0;
+    } else if (status.cm >= stop_cm + 5) {
+        if (*clear_samples < 2) ++*clear_samples;
+        if (*clear_samples >= 2) status.blocked = false;
+    } else {
+        *clear_samples = 0;
+    }
+}
+
 static void sonar_task(void *unused)
 {
     (void)unused;
@@ -183,20 +247,7 @@ static void sonar_task(void *unused)
 
         taskENTER_CRITICAL(&guard);
         echo_open = false;
-        status.echo_us = (int)echo_width;
-        status.valid = echo_width >= 100 && echo_width <= 23500;
-        status.cm = status.valid ? (int)((echo_width + 29) / 58) : -1;
-        ++status.measurement;
-        last_measurement = esp_timer_get_time();
-        if (!status.valid || status.cm <= robot_config.stop_cm) {
-            status.blocked = true;
-            clear_samples = 0;
-        } else if (status.cm >= robot_config.stop_cm + 5) {
-            if (clear_samples < 2) ++clear_samples;
-            if (clear_samples >= 2) status.blocked = false;
-        } else {
-            clear_samples = 0;
-        }
+        record_sonar_locked((int)echo_width, esp_timer_get_time(), &clear_samples);
         taskEXIT_CRITICAL(&guard);
         vTaskDelayUntil(&next, pdMS_TO_TICKS(65));
     }
@@ -214,8 +265,16 @@ static esp_err_t pair(int motor, int speed, bool brake)
 {
     int first = speed > 0 ? speed : 0;
     int second = speed < 0 ? -speed : 0;
-    if (brake) first = second = 255;
-    int channel = motor * 2;
+    // 8-bit LEDC on S3: 256 is constant high. Slow decay drives for
+    // |speed| ticks and brakes for the remainder of the 256-tick cycle.
+    if (brake) {
+        first = second = 256;
+    } else if (robot_config.quiet_pwm && speed != 0) {
+        first = 256 - second;
+        second = speed > 0 ? 256 - speed : 256;
+    }
+    int physical_motor = (robot_config.swap_rear && motor >= 2) ? (motor ^ 1) : motor;
+    int channel = physical_motor * 2;
     esp_err_t error = set_motor_duty(channel, first);
     if (error != ESP_OK) return error;
     return set_motor_duty(channel + 1, second);
@@ -228,6 +287,7 @@ static void motor_output_failed(int motor, esp_err_t error)
     stop_locked(esp_timer_get_time());
     status.armed = status.moving = false;
     status.output_fault = true;
+    status.stop_reason = "pwm";
     status.result = MOTION_ABORTED;
     brake_until = armed_until = 0;
     taskEXIT_CRITICAL(&guard);
@@ -245,7 +305,7 @@ static void motor_task(void *unused)
 {
     (void)unused;
     int previous[4] = {0};
-    bool last_brake = false, last_enable = false;
+    bool previous_brake[4] = {false}, last_enable = false;
     TickType_t next = xTaskGetTickCount();
 
     while (true) {
@@ -255,8 +315,13 @@ static void motor_task(void *unused)
         taskENTER_CRITICAL(&guard);
         if (status.armed && now >= armed_until) status.armed = false;
         if (command.action != STOP) {
-            if (!status.armed || !shift_allowed(command.action, now)) {
-                finish_locked(MOTION_ABORTED, now);
+            if (!status.armed || (!shift_allowed(command.action, command.source, now) &&
+                                  !waiting_for_single_wheel_echo(now))) {
+                const char *reason = "obstacle";
+                if (!status.armed) reason = "lock";
+                else if (!last_measurement || now - last_measurement >= MAX_SAMPLE_AGE_US) reason = "stale";
+                else if (!status.valid) reason = status.echo_us ? "echo_range" : "echo";
+                abort_locked(reason, now);
             } else {
                 if (!command.started) {
                     command.started = now;
@@ -287,23 +352,25 @@ static void motor_task(void *unused)
         }
         status.moving = command.action != STOP;
         bool brake = !status.moving && now < brake_until;
+        int brake_wheel = command.wheel;
         bool enabled = status.armed || brake;
         taskEXIT_CRITICAL(&guard);
 
         if (enabled && !last_enable) gpio_set_level(PIN_SLEEP, 1);
         for (int i = 0; i < 4; ++i) {
-            if (output[i] == previous[i] && brake == last_brake) continue;
-            esp_err_t error = pair(i, output[i], brake);
+            bool brake_this_wheel = brake && (brake_wheel < 0 || brake_wheel == i);
+            if (output[i] == previous[i] && brake_this_wheel == previous_brake[i]) continue;
+            esp_err_t error = pair(i, output[i], brake_this_wheel);
             if (error != ESP_OK) {
                 motor_output_failed(i, error);
                 vTaskDelete(NULL);
                 return;
             }
             previous[i] = output[i];
+            previous_brake[i] = brake_this_wheel;
         }
         if (!enabled && last_enable) gpio_set_level(PIN_SLEEP, 0);
         last_enable = enabled;
-        last_brake = brake;
         if (finished_ticket) {
             taskENTER_CRITICAL(&guard);
             if (status.ticket == finished_ticket && status.result == MOTION_RUNNING) status.result = MOTION_DONE;
@@ -330,7 +397,7 @@ void motion_start(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_ECHO, echo_isr, NULL));
     const ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = LEDC_TIMER_0, .freq_hz = 18000, .clk_cfg = LEDC_AUTO_CLK,
+        .timer_num = LEDC_TIMER_0, .freq_hz = robot_config.quiet_pwm ? 24000 : 1000, .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
     for (int i = 0; i < sizeof(MOTOR_PINS) / sizeof(MOTOR_PINS[0]); ++i) {
