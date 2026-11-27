@@ -9,9 +9,9 @@ enum {
     // H2: sonar on pins 4–5, shared I2S on pins 6–9.
     PIN_TRIG = 1, PIN_ECHO = 2,
     PIN_BCLK = 42, PIN_WS = 41, PIN_MIC = 40, PIN_SPEAKER = 39,
-    // H1: rear on pins 8–11, front on pins 16–19, shared enable on pin 20.
-    PIN_LF_A = 10, PIN_LF_B = 11, PIN_RF_A = 12, PIN_RF_B = 13,
-    PIN_LR_A = 15, PIN_LR_B = 16, PIN_RR_A = 17, PIN_RR_B = 18,
+    // H1: front on pins 8–11, rear on pins 16–19, shared enable on pin 20.
+    PIN_LF_A = 15, PIN_LF_B = 16, PIN_RF_A = 17, PIN_RF_B = 18,
+    PIN_LR_A = 10, PIN_LR_B = 11, PIN_RR_A = 12, PIN_RR_B = 13,
     PIN_SLEEP = 14,
     SAMPLE_RATE = 16000, MAX_FRAME = 512, MAX_WIRE_BYTES = 2048,
 };
